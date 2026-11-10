@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#120c1a" />
+    <link rel="icon" type="image/svg+xml" href="/src/assets/minecraft-logo.svg" />
+    <title>Bee Launcher — Minecraft Java launcher</title>
+  </head>
+  <body>
+    <img class="bd" id="bd" alt="" aria-hidden="true" />
+    <div class="win" id="win">
+      <div class="stage" aria-hidden="true">
+        <img class="art on" id="a1" alt="" />
+        <img class="art" id="a2" alt="" />
+        <div class="logo" id="logo"><img class="logo-mark" id="minecraft-logo" alt="Minecraft" /></div>
+      </div>
+      <div class="fade" aria-hidden="true"></div>
+      <div class="window-drag" id="window-drag" aria-label="Drag to move the launcher"></div>
+      <div class="resize-zones" aria-hidden="true">
+        <span class="resize-edge north" data-resize="North"></span><span class="resize-edge south" data-resize="South"></span>
+        <span class="resize-edge east" data-resize="East"></span><span class="resize-edge west" data-resize="West"></span>
+        <span class="resize-edge north-east" data-resize="NorthEast"></span><span class="resize-edge north-west" data-resize="NorthWest"></span>
+        <span class="resize-edge south-east" data-resize="SouthEast"></span><span class="resize-edge south-west" data-resize="SouthWest"></span>
+      </div>
+
+      <header class="top">
+        <div class="top-leading">
+          <div class="window-controls" aria-label="Window controls">
+            <button class="mac-control close" id="window-close" aria-label="Close window" title="Close"></button>
+            <button class="mac-control minimize" id="window-minimize" aria-label="Minimize window" title="Minimize"></button>
+            <button class="mac-control maximize" id="window-maximize" aria-label="Maximize window" title="Maximize" aria-pressed="false"></button>
+          </div>
+          <button class="acct" id="settings-shortcut" aria-label="Open player and launcher settings">
+            <span class="face" id="me" aria-hidden="true"></span>
+            <span><b id="account-name">Player</b><small>Local player · settings</small></span>
+          </button>
+        </div>
+      </header>
+
+      <section class="sheet" id="sheet" aria-live="polite" aria-label="Launcher panel"></section>
+
+      <main class="dock" aria-label="Launch Minecraft">
+        <div class="ver">
+          <img class="ico" id="i5" alt="" />
+          <span class="vt"><b id="vn">Scanning profiles…</b><small id="vv">Local .minecraft</small></span>
+          <select id="version-select" aria-label="Installed Minecraft profile">
+            <option value="">Scanning .minecraft…</option>
+          </select>
+        </div>
+        <div class="playw">
+          <button class="play" id="play-button" title="Start the selected Minecraft profile" aria-label="Start the selected Minecraft profile" disabled>Play</button>
+          <div class="bar" id="pbar" aria-hidden="true"><b id="pfill"></b></div>
+          <div class="stat sr-only" id="stat" role="status" aria-live="polite">Looking for installed profiles…</div>
+        </div>
+        <button class="quick" id="quick-play" title="Quick Play starts the same selected profile directly" aria-label="Quick Play: start the selected Minecraft profile" disabled>
+          <span class="gem" aria-hidden="true">R</span>
+          Quick play
+          <span class="ch" aria-hidden="true">›</span>
+        </button>
+      </main>
+
+      <nav class="nav" id="sub" aria-label="Launcher sections">
+        <button data-s="play" aria-current="page">Play</button>
+        <button data-s="inst">Installations</button>
+        <button data-s="realms">Realms</button>
+        <button data-s="skins">Skins</button>
+        <button data-s="mods">Mods</button>
+        <button data-s="servers">Servers</button>
+          <button data-s="notes">Patch notes</button>
+        <button class="news" id="news-button" aria-expanded="false">News<span id="chev">▴</span></button>
+      </nav>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      <aside class="drawer" id="drawer" aria-label="Local launcher information">
+        <div class="dh"><h2>Local launcher</h2><button id="news-close" aria-label="Close information">✕</button></div>
+        <div class="cards">
+          <article class="card"><i style="background:linear-gradient(135deg,#6b4a2f,#b8945f)"></i><div><b>Profiles from this PC</b><small>Bee Launcher scans the selected .minecraft folder and launches installed vanilla or Fabric profiles from disk.</small></div></article>
+          <article class="card"><i style="background:linear-gradient(135deg,#243a9a,#5a7fe0)"></i><div><b>Missing files</b><small>When a profile declares a download URL, the launcher checks the file size and SHA-1 before using it.</small></div></article>
+          <article class="card"><i style="background:linear-gradient(135deg,#f08ac0,#ffb457)"></i><div><b>Offline account mode</b><small>This build does not use Microsoft or TLauncher sign-in tokens. Online servers that require authentication are not supported.</small></div></article>
+        </div>
+      </aside>
+      <span id="status-text" class="sr-only" aria-live="polite">Searching for Minecraft profiles</span>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
