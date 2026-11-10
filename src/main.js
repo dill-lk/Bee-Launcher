@@ -498,7 +498,7 @@ function openPanel(name, title = '') {
   } else if (name === 'mods') {
     sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or Bee Launcher ZIP')}
       <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>The pack gets its own game folder. Your existing .minecraft mods, configs, and saves stay untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose .mrpack or ZIP</button>
-        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">This may take a while while Minecraft files download.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
+        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">ZIPs reuse installed Minecraft files; .mrpacks may download missing files.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
       <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>`;

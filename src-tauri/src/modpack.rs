@@ -592,6 +592,370 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
+fn version_is_a_profile_token(value: &str, version: &str) -> bool {
+    value.match_indices(version).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_is_boundary = value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '.');
+        let after_is_boundary = value[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '.');
+        before_is_boundary && after_is_boundary
+    })
+}
+
+fn metadata_has_loader(metadata: &Value, loader: &str) -> bool {
+    let coordinate = format!("net.fabricmc:fabric-loader:{loader}");
+    metadata
+        .get("libraries")
+        .and_then(Value::as_array)
+        .is_some_and(|libraries| {
+            libraries.iter().any(|library| {
+                library.get("name").and_then(Value::as_str) == Some(coordinate.as_str())
+            })
+        })
+}
+
+fn find_installed_pack_profile(
+    game_dir: &Path,
+    minecraft: &str,
+    fabric_loader: Option<&str>,
+) -> Result<(String, Vec<(String, Value)>), String> {
+    let versions_dir = game_dir.join("versions");
+    let entries = fs::read_dir(&versions_dir).map_err(|error| {
+        format!(
+            "Could not find installed Minecraft profiles in {}: {error}",
+            game_dir.display()
+        )
+    })?;
+    let mut profile_dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.path())
+        .collect();
+    profile_dirs.sort();
+
+    for profile_dir in profile_dirs {
+        let profile_id = profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if ensure_version_id(profile_id).is_err() {
+            continue;
+        }
+        let Some(metadata) = super::metadata_at(game_dir, profile_id) else {
+            continue;
+        };
+        if metadata.get("id").and_then(Value::as_str) != Some(profile_id) {
+            continue;
+        }
+        let Ok(chain) = super::metadata_chain(game_dir, profile_id) else {
+            continue;
+        };
+        let matches_minecraft =
+            if let Some(parent) = metadata.get("inheritsFrom").and_then(Value::as_str) {
+                chain.iter().any(|(id, _)| id == minecraft) || parent == minecraft
+            } else if profile_id == minecraft {
+                true
+            } else {
+                version_is_a_profile_token(profile_id, minecraft)
+            };
+        if !matches_minecraft {
+            continue;
+        }
+        let matches_loader = match fabric_loader {
+            Some(loader) => chain
+                .iter()
+                .any(|(_, item)| metadata_has_loader(item, loader)),
+            None => profile_id == minecraft,
+        };
+        if !matches_loader {
+            continue;
+        }
+        if !chain
+            .iter()
+            .any(|(_, item)| item.get("mainClass").and_then(Value::as_str).is_some())
+            || !chain
+                .iter()
+                .any(|(id, _)| super::version_jar(game_dir, id).is_some())
+        {
+            continue;
+        }
+        return Ok((profile_id.to_string(), chain));
+    }
+
+    let loader = fabric_loader
+        .map(|version| format!(" with Fabric Loader {version}"))
+        .unwrap_or_default();
+    Err(format!(
+        "This ZIP needs Minecraft {minecraft}{loader}, but that profile is not installed in the selected .minecraft folder. Install and launch that profile once, then import the ZIP again. Bee ZIP imports do not fetch Minecraft's version list."
+    ))
+}
+
+fn copy_local_file(
+    source: &Path,
+    destination: &Path,
+    expected_size: Option<u64>,
+    expected_sha1: Option<&str>,
+    label: &str,
+) -> Result<(), String> {
+    if artifact_matches(destination, expected_size, expected_sha1) {
+        return Ok(());
+    }
+    if !artifact_matches(source, expected_size, expected_sha1) {
+        return Err(format!(
+            "Could not reuse the installed {label} from {}. Open that Minecraft profile once so its files are installed, then retry the ZIP import.",
+            source.display()
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("Invalid destination for {label}."))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create the folder for {label}: {error}"))?;
+    if destination.exists() {
+        fs::remove_file(destination)
+            .map_err(|error| format!("Could not replace the local {label}: {error}"))?;
+    }
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination)
+            .map_err(|error| format!("Could not reuse the installed {label}: {error}"))?;
+    }
+    if !artifact_matches(destination, expected_size, expected_sha1) {
+        let _ = fs::remove_file(destination);
+        return Err(format!(
+            "The reused local {label} failed its integrity check."
+        ));
+    }
+    Ok(())
+}
+
+fn copy_installed_profile(
+    source_game_dir: &Path,
+    destination_game_dir: &Path,
+    chain: &[(String, Value)],
+) -> Result<(), String> {
+    for (id, metadata) in chain {
+        ensure_version_id(id)?;
+        let json_path = safe_join(destination_game_dir, &format!("versions/{id}/{id}.json"))?;
+        write_json(&json_path, metadata, "reused Minecraft profile metadata")?;
+        let source_jar = super::version_jar(source_game_dir, id).ok_or_else(|| {
+            format!(
+                "The installed profile {id} is missing its client JAR; launch it once, then retry."
+            )
+        })?;
+        let destination_jar = safe_join(destination_game_dir, &format!("versions/{id}/{id}.jar"))?;
+        let client = metadata.pointer("/downloads/client");
+        let size = client
+            .and_then(|item| item.get("size"))
+            .and_then(Value::as_u64);
+        let sha1 = client
+            .and_then(|item| item.get("sha1"))
+            .and_then(Value::as_str);
+        copy_local_file(
+            &source_jar,
+            &destination_jar,
+            size,
+            sha1,
+            &format!("Minecraft client JAR for {id}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_installed_libraries(
+    source_game_dir: &Path,
+    destination_game_dir: &Path,
+    chain: &[(String, Value)],
+) -> Result<(), String> {
+    let mut prepared = HashSet::new();
+    for (_, metadata) in chain {
+        let Some(libraries) = metadata.get("libraries").and_then(Value::as_array) else {
+            continue;
+        };
+        for library in libraries {
+            if !super::allowed_by_rules(library, super::current_os_name()) {
+                continue;
+            }
+            let name = library
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Minecraft library");
+            if name
+                .rsplit(':')
+                .next()
+                .is_some_and(|part| part.starts_with("natives-"))
+                && !super::current_native_os_classifier(name)
+            {
+                continue;
+            }
+            if let Some(spec) = library_artifact_spec(library) {
+                if prepared.insert(spec.relative_path.clone()) {
+                    copy_local_artifact(source_game_dir, destination_game_dir, &spec, name)?;
+                }
+            }
+            if let Some((classifier, _)) = super::native_classifier(library) {
+                if let Some(artifact) = library
+                    .pointer("/downloads/classifiers")
+                    .and_then(|classifiers| classifiers.get(&classifier))
+                {
+                    let mut spec = artifact_spec(artifact, None, None).ok_or_else(|| {
+                        format!("Native library {name} has incomplete download metadata.")
+                    })?;
+                    spec.relative_path = super::minecraft_library_destination(&spec.relative_path);
+                    if prepared.insert(spec.relative_path.clone()) {
+                        copy_local_artifact(
+                            source_game_dir,
+                            destination_game_dir,
+                            &spec,
+                            &format!("native library {name}"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_local_artifact(
+    source_game_dir: &Path,
+    destination_game_dir: &Path,
+    spec: &ArtifactSpec,
+    label: &str,
+) -> Result<(), String> {
+    let source = safe_join(source_game_dir, &spec.relative_path)?;
+    let destination = safe_join(destination_game_dir, &spec.relative_path)?;
+    copy_local_file(
+        &source,
+        &destination,
+        spec.size,
+        spec.sha1.as_deref(),
+        label,
+    )
+}
+
+fn copy_installed_assets(
+    app: Option<&AppHandle>,
+    source_game_dir: &Path,
+    destination_game_dir: &Path,
+    chain: &[(String, Value)],
+) -> Result<(), String> {
+    let asset_index = chain
+        .iter()
+        .find_map(|(_, metadata)| metadata.get("assetIndex"))
+        .ok_or_else(|| {
+            "The installed Minecraft profile has no asset-index metadata.".to_string()
+        })?;
+    let index_id = asset_index
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The Minecraft asset index has no ID.".to_string())?;
+    if index_id.is_empty()
+        || !index_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("The Minecraft asset-index ID is invalid.".to_string());
+    }
+    let relative = format!("assets/indexes/{index_id}.json");
+    let spec = artifact_spec(asset_index, Some(relative), None).ok_or_else(|| {
+        "The installed Minecraft profile has incomplete asset-index metadata.".to_string()
+    })?;
+    let index_path = safe_join(destination_game_dir, &spec.relative_path)?;
+    copy_local_artifact(
+        source_game_dir,
+        destination_game_dir,
+        &spec,
+        "Minecraft asset index",
+    )?;
+    let index_size = fs::metadata(&index_path)
+        .map_err(|error| format!("Could not read Minecraft asset-index details: {error}"))?
+        .len();
+    if index_size > MAX_ASSET_INDEX_BYTES {
+        return Err("The Minecraft asset index is unexpectedly large.".to_string());
+    }
+    let index_value: Value = serde_json::from_slice(
+        &fs::read(&index_path)
+            .map_err(|error| format!("Could not read Minecraft asset index: {error}"))?,
+    )
+    .map_err(|error| format!("Minecraft asset index is invalid: {error}"))?;
+    let objects = index_value
+        .get("objects")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Minecraft asset index has no asset objects.".to_string())?;
+    let mut hashes_seen = HashSet::new();
+    let mut specs = Vec::with_capacity(objects.len());
+    for (name, object) in objects {
+        let hash = object
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Minecraft asset {name} has no checksum."))?;
+        if !valid_sha1(hash) {
+            return Err(format!("Minecraft asset {name} has an invalid checksum."));
+        }
+        if !hashes_seen.insert(hash.to_ascii_lowercase()) {
+            continue;
+        }
+        let size = object
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("Minecraft asset {name} has no size."))?;
+        let prefix = &hash[..2];
+        specs.push((
+            ArtifactSpec {
+                relative_path: format!("assets/objects/{prefix}/{hash}"),
+                url: format!("https://resources.download.minecraft.net/{prefix}/{hash}"),
+                fallback_urls: Vec::new(),
+                sha1: Some(hash.to_string()),
+                size: Some(size),
+            },
+            name.clone(),
+        ));
+    }
+    let total = specs.len();
+    if let Some(app) = app {
+        report_progress(
+            app,
+            "assets",
+            "Reusing installed Minecraft assets",
+            0,
+            total,
+            52,
+        );
+    }
+    for (index, (spec, name)) in specs.iter().enumerate() {
+        copy_local_artifact(
+            source_game_dir,
+            destination_game_dir,
+            spec,
+            &format!("Minecraft asset {name}"),
+        )?;
+        if let Some(app) = app {
+            let count = index + 1;
+            if count == total || count % 32 == 0 {
+                let percent = if total == 0 {
+                    74
+                } else {
+                    52 + ((count * 22) / total) as u8
+                };
+                report_progress(
+                    app,
+                    "assets",
+                    "Reusing installed Minecraft assets",
+                    count,
+                    total,
+                    percent,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn install_version_metadata(
     app: Option<&AppHandle>,
     client: &Client,
@@ -1249,6 +1613,11 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
     if is_bundle && local_entries.len() < client_file_count {
         return Err("This ZIP does not contain every client mod listed in its Modrinth manifest. Choose the Bee Launcher bundle ZIP or the original .mrpack instead.".to_string());
     }
+    let installed_game_dir = if is_bundle {
+        Some(super::resolve_game_dir(app)?)
+    } else {
+        None
+    };
     let instances = app_instances_dir(app)?;
     let (instance_id, instance_dir) = allocate_instance_dir(&instances, &manifest.name)?;
     let result = (|| {
@@ -1262,34 +1631,73 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
         );
         copy_overrides(&pack_path, &instance_dir, app)?;
         let client = downloader()?;
-        let profile_id = install_version_metadata(
-            Some(app),
-            &client,
-            &instance_dir,
-            &minecraft_version,
-            fabric_loader.as_deref(),
-        )?;
-        report_progress(
-            app,
-            "minecraft",
-            "Preparing Minecraft client and libraries",
-            0,
-            1,
-            25,
-        );
-        let chain = super::metadata_chain(&instance_dir, &profile_id)?;
-        super::ensure_client_jar(&client, &instance_dir, &chain)?;
-        super::ensure_library_artifacts(&client, &instance_dir, &chain)?;
-        let _ = super::install_bundled_authlib(&instance_dir, &chain)?;
-        report_progress(
-            app,
-            "minecraft",
-            "Minecraft client and libraries are ready",
-            1,
-            1,
-            50,
-        );
-        install_assets(app, &client, &instance_dir, &chain)?;
+        let profile_id = if let Some(source_game_dir) = installed_game_dir.as_deref() {
+            report_progress(
+                app,
+                "minecraft",
+                format!("Finding installed Minecraft {minecraft_version} profile"),
+                0,
+                1,
+                15,
+            );
+            let (profile_id, source_chain) = find_installed_pack_profile(
+                source_game_dir,
+                &minecraft_version,
+                fabric_loader.as_deref(),
+            )?;
+            copy_installed_profile(source_game_dir, &instance_dir, &source_chain)?;
+            let chain = super::metadata_chain(&instance_dir, &profile_id)?;
+            report_progress(
+                app,
+                "minecraft",
+                format!("Reusing installed {profile_id} profile and libraries"),
+                0,
+                1,
+                25,
+            );
+            copy_installed_libraries(source_game_dir, &instance_dir, &chain)?;
+            let _ = super::install_bundled_authlib(&instance_dir, &chain)?;
+            copy_installed_assets(Some(app), source_game_dir, &instance_dir, &chain)?;
+            report_progress(
+                app,
+                "minecraft",
+                "Installed Minecraft profile and runtime reused",
+                1,
+                1,
+                74,
+            );
+            profile_id
+        } else {
+            let profile_id = install_version_metadata(
+                Some(app),
+                &client,
+                &instance_dir,
+                &minecraft_version,
+                fabric_loader.as_deref(),
+            )?;
+            report_progress(
+                app,
+                "minecraft",
+                "Preparing Minecraft client and libraries",
+                0,
+                1,
+                25,
+            );
+            let chain = super::metadata_chain(&instance_dir, &profile_id)?;
+            super::ensure_client_jar(&client, &instance_dir, &chain)?;
+            super::ensure_library_artifacts(&client, &instance_dir, &chain)?;
+            let _ = super::install_bundled_authlib(&instance_dir, &chain)?;
+            report_progress(
+                app,
+                "minecraft",
+                "Minecraft client and libraries are ready",
+                1,
+                1,
+                50,
+            );
+            install_assets(app, &client, &instance_dir, &chain)?;
+            profile_id
+        };
         let installed_files = install_pack_files(
             app,
             &client,
@@ -1389,6 +1797,174 @@ mod tests {
             manifest.files.len()
         );
         fs::remove_dir_all(destination).expect("temporary test folder should be removed");
+    }
+
+    #[test]
+    fn prepares_outbreak_zip_from_installed_fabric_fixture_without_web_metadata() {
+        let pack = Path::new("/workspace/OUTBREAK-Last-Signal-Bee-Launcher.zip");
+        if !pack.exists() {
+            return;
+        }
+        let manifest = read_manifest(pack).expect("Bee ZIP manifest should parse");
+        let (minecraft, fabric) = validate_manifest(&manifest).expect("Bee ZIP manifest is valid");
+        assert_eq!(minecraft, "26.3");
+        assert_eq!(fabric.as_deref(), Some("0.19.5"));
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-outbreak-offline-test-{unique}"));
+        let source = root.join("installed-minecraft");
+        let destination = root.join("instances/outbreak-last-signal");
+        let profile_id = "Fabric 26.3";
+        let profile_dir = source.join("versions").join(profile_id);
+        fs::create_dir_all(&profile_dir).expect("fixture profile folder should be created");
+
+        let client_jar = b"fixture minecraft client";
+        let fabric_loader_jar = b"fixture Fabric loader";
+        let library_jar = b"fixture minecraft library";
+        let asset_bytes = b"fixture minecraft asset";
+        let asset_hash = sha1_bytes(asset_bytes);
+        let asset_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/item": {
+                    "hash": asset_hash,
+                    "size": asset_bytes.len()
+                }
+            }
+        }))
+        .expect("fixture asset index should encode");
+
+        let mut profile: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/Fabric26.3.json"))
+                .expect("Fabric 26.3 fixture should parse");
+        profile["libraries"] = serde_json::json!([
+            {
+                "name": "net.fabricmc:fabric-loader:0.19.5",
+                "downloads": {
+                    "artifact": {
+                        "path": "net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar",
+                        "sha1": sha1_bytes(fabric_loader_jar),
+                        "size": fabric_loader_jar.len(),
+                        "url": "https://example.invalid/fabric-loader.jar"
+                    }
+                }
+            },
+            {
+                "name": "test.offline:fixture-library:1.0",
+                "downloads": {
+                    "artifact": {
+                        "path": "test/offline/fixture-library/1.0/fixture-library-1.0.jar",
+                        "sha1": sha1_bytes(library_jar),
+                        "size": library_jar.len(),
+                        "url": "https://example.invalid/fixture-library.jar"
+                    }
+                }
+            }
+        ]);
+        profile["downloads"]["client"] = serde_json::json!({
+            "url": "https://example.invalid/client.jar",
+            "sha1": sha1_bytes(client_jar),
+            "size": client_jar.len()
+        });
+        profile["assetIndex"] = serde_json::json!({
+            "id": "fixture-assets",
+            "url": "https://example.invalid/fixture-assets.json",
+            "size": asset_index.len()
+        });
+
+        fs::write(
+            profile_dir.join(format!("{profile_id}.json")),
+            serde_json::to_vec_pretty(&profile).expect("fixture profile should encode"),
+        )
+        .expect("fixture profile metadata should be written");
+        fs::write(profile_dir.join(format!("{profile_id}.jar")), client_jar)
+            .expect("fixture client JAR should be written");
+        let loader_path =
+            source.join("libraries/net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar");
+        fs::create_dir_all(
+            loader_path
+                .parent()
+                .expect("Fabric library parent should exist"),
+        )
+        .expect("fixture Fabric library folder should be created");
+        fs::write(&loader_path, fabric_loader_jar)
+            .expect("fixture Fabric loader should be written");
+        let library_path =
+            source.join("libraries/test/offline/fixture-library/1.0/fixture-library-1.0.jar");
+        fs::create_dir_all(library_path.parent().expect("library parent should exist"))
+            .expect("fixture library folder should be created");
+        fs::write(&library_path, library_jar).expect("fixture library JAR should be written");
+        let index_path = source.join("assets/indexes/fixture-assets.json");
+        fs::create_dir_all(index_path.parent().expect("index parent should exist"))
+            .expect("fixture asset index folder should be created");
+        fs::write(&index_path, &asset_index).expect("fixture asset index should be written");
+        let asset_path = source.join(format!(
+            "assets/objects/{}/{}",
+            &asset_hash[..2],
+            asset_hash
+        ));
+        fs::create_dir_all(asset_path.parent().expect("asset parent should exist"))
+            .expect("fixture asset folder should be created");
+        fs::write(&asset_path, asset_bytes).expect("fixture asset should be written");
+
+        let (found_id, source_chain) =
+            find_installed_pack_profile(&source, &minecraft, fabric.as_deref())
+                .expect("installed Fabric profile should match the ZIP pins");
+        assert_eq!(found_id, profile_id);
+        copy_installed_profile(&source, &destination, &source_chain)
+            .expect("installed profile metadata and client should be reused");
+        let chain = super::super::metadata_chain(&destination, &found_id)
+            .expect("copied profile chain should be valid");
+        copy_installed_libraries(&source, &destination, &chain)
+            .expect("installed libraries should be reused");
+        copy_installed_assets(None, &source, &destination, &chain)
+            .expect("installed assets should be reused");
+
+        let entries = local_bundle_entries(pack, &manifest.files)
+            .expect("bundle entries should match the manifest");
+        assert_eq!(entries.len(), manifest.files.len());
+        for pack_file in &manifest.files {
+            let archive_name = entries
+                .get(&pack_file.path)
+                .expect("bundle should contain each manifest file");
+            extract_bundle_file(pack, archive_name, &destination, pack_file)
+                .unwrap_or_else(|error| panic!("{} should verify: {error}", pack_file.path));
+        }
+        assert_eq!(
+            fs::read_dir(destination.join("mods"))
+                .expect("instance mods folder should exist")
+                .count(),
+            21
+        );
+        assert_eq!(
+            fs::read(destination.join(format!("versions/{profile_id}/{profile_id}.jar"))).unwrap(),
+            client_jar
+        );
+        assert_eq!(
+            fs::read(
+                destination
+                    .join("libraries/test/offline/fixture-library/1.0/fixture-library-1.0.jar")
+            )
+            .unwrap(),
+            library_jar
+        );
+        assert_eq!(
+            fs::read(destination.join(format!(
+                "assets/objects/{}/{}",
+                &asset_hash[..2],
+                asset_hash
+            )))
+            .unwrap(),
+            asset_bytes
+        );
+        assert!(source
+            .join("versions")
+            .join(profile_id)
+            .join(format!("{profile_id}.json"))
+            .is_file());
+        fs::remove_dir_all(root).expect("fixture folders should be removed");
     }
 
     #[test]
