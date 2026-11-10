@@ -19,6 +19,11 @@ const MAX_PACK_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_PACK_FILE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const MAX_PACK_FILES: usize = 50_000;
 const MAX_ASSET_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MINECRAFT_VERSION_MANIFEST_URLS: [&str; 2] = [
+    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+    "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json",
+];
+const METADATA_REQUEST_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -430,7 +435,7 @@ fn override_relative_path(archive_name: &str) -> Option<&str> {
     None
 }
 
-fn request_json(
+fn request_json_once(
     client: &Client,
     url: &str,
     label: &str,
@@ -442,6 +447,7 @@ fn request_json(
     }
     let response = client
         .get(url)
+        .timeout(Duration::from_secs(45))
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|error| format!("Could not fetch {label}: {error}"))?;
@@ -467,6 +473,103 @@ fn request_json(
         .map_err(|error| format!("The downloaded {label} is not valid JSON: {error}"))
 }
 
+fn request_json(
+    client: &Client,
+    url: &str,
+    label: &str,
+    expected_sha1: Option<&str>,
+    limit: u64,
+) -> Result<Value, String> {
+    let mut last_error = None;
+    for attempt in 0..METADATA_REQUEST_ATTEMPTS {
+        match request_json_once(client, url, label, expected_sha1, limit) {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < METADATA_REQUEST_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(if attempt == 0 { 300 } else { 900 }));
+        }
+    }
+    Err(format!(
+        "{} Retried {METADATA_REQUEST_ATTEMPTS} times; check your connection and try importing again.",
+        last_error.unwrap_or_else(|| format!("Could not fetch {label}."))
+    ))
+}
+
+fn request_json_from_sources(
+    client: &Client,
+    sources: &[String],
+    label: &str,
+    expected_sha1: Option<&str>,
+    limit: u64,
+) -> Result<Value, String> {
+    let mut failures = Vec::new();
+    for source in sources {
+        match request_json(client, source, label, expected_sha1, limit) {
+            Ok(value) => return Ok(value),
+            Err(error) => failures.push(format!("{source}: {error}")),
+        }
+    }
+    Err(format!(
+        "Could not fetch {label} from Mojang's official metadata hosts. Check your connection and try importing again. {}",
+        failures.join(" | ")
+    ))
+}
+
+fn mojang_version_metadata_sources(url: &str) -> Result<Vec<String>, String> {
+    let (alternate_host, path) =
+        if let Some(path) = url.strip_prefix("https://piston-meta.mojang.com/") {
+            ("launchermeta.mojang.com", path)
+        } else if let Some(path) = url.strip_prefix("https://launchermeta.mojang.com/") {
+            ("piston-meta.mojang.com", path)
+        } else {
+            return Err("Mojang's version list contains an untrusted metadata URL.".to_string());
+        };
+    Ok(vec![
+        url.to_string(),
+        format!("https://{alternate_host}/{path}"),
+    ])
+}
+
+fn minecraft_version_manifest_sources() -> Vec<String> {
+    MINECRAFT_VERSION_MANIFEST_URLS
+        .iter()
+        .map(|url| (*url).to_string())
+        .collect()
+}
+
+fn minecraft_version_manifest(client: &Client, minecraft: &str) -> Result<Value, String> {
+    let mut failures = Vec::new();
+    for source in minecraft_version_manifest_sources() {
+        match request_json(
+            client,
+            &source,
+            "the Minecraft version list",
+            None,
+            16 * 1024 * 1024,
+        ) {
+            Ok(manifest) => {
+                let versions = manifest.get("versions").and_then(Value::as_array);
+                if versions.is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|entry| entry.get("id").and_then(Value::as_str) == Some(minecraft))
+                }) {
+                    return Ok(manifest);
+                }
+                failures.push(format!(
+                    "{source}: the response does not list Minecraft {minecraft}"
+                ));
+            }
+            Err(error) => failures.push(format!("{source}: {error}")),
+        }
+    }
+    Err(format!(
+        "Could not fetch Minecraft {minecraft} from Mojang's official metadata hosts. Check your connection and try importing again. {}",
+        failures.join(" | ")
+    ))
+}
+
 fn write_json(path: &Path, value: &Value, label: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -490,27 +593,23 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn install_version_metadata(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     client: &Client,
     game_dir: &Path,
     minecraft: &str,
     fabric_loader: Option<&str>,
 ) -> Result<String, String> {
-    report_progress(
-        app,
-        "minecraft",
-        format!("Resolving Minecraft {minecraft}"),
-        0,
-        1,
-        15,
-    );
-    let manifest = request_json(
-        client,
-        "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
-        "the Minecraft version list",
-        None,
-        16 * 1024 * 1024,
-    )?;
+    if let Some(app) = app {
+        report_progress(
+            app,
+            "minecraft",
+            format!("Resolving Minecraft {minecraft}"),
+            0,
+            1,
+            15,
+        );
+    }
+    let manifest = minecraft_version_manifest(client, minecraft)?;
     let versions = manifest
         .get("versions")
         .and_then(Value::as_array)
@@ -526,9 +625,10 @@ fn install_version_metadata(
         .and_then(Value::as_str)
         .ok_or_else(|| format!("Minecraft {minecraft} has no version metadata URL."))?;
     let expected_sha1 = entry.get("sha1").and_then(Value::as_str);
-    let minecraft_metadata = request_json(
+    let minecraft_sources = mojang_version_metadata_sources(metadata_url)?;
+    let minecraft_metadata = request_json_from_sources(
         client,
-        metadata_url,
+        &minecraft_sources,
         &format!("Minecraft {minecraft} metadata"),
         expected_sha1,
         16 * 1024 * 1024,
@@ -544,24 +644,28 @@ fn install_version_metadata(
     )?;
 
     let Some(loader) = fabric_loader else {
-        report_progress(
-            app,
-            "minecraft",
-            format!("Minecraft {minecraft} metadata ready"),
-            1,
-            1,
-            18,
-        );
+        if let Some(app) = app {
+            report_progress(
+                app,
+                "minecraft",
+                format!("Minecraft {minecraft} metadata ready"),
+                1,
+                1,
+                18,
+            );
+        }
         return Ok(minecraft.to_string());
     };
-    report_progress(
-        app,
-        "fabric",
-        format!("Resolving Fabric Loader {loader}"),
-        0,
-        1,
-        19,
-    );
+    if let Some(app) = app {
+        report_progress(
+            app,
+            "fabric",
+            format!("Resolving Fabric Loader {loader}"),
+            0,
+            1,
+            19,
+        );
+    }
     let url = format!(
         "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
         encode_path_segment(minecraft),
@@ -604,14 +708,16 @@ fn install_version_metadata(
         &format!("versions/{profile_id}/{profile_id}.json"),
     )?;
     write_json(&fabric_path, &fabric_metadata, "Fabric Loader profile")?;
-    report_progress(
-        app,
-        "fabric",
-        format!("Fabric Loader {loader} profile ready"),
-        1,
-        1,
-        22,
-    );
+    if let Some(app) = app {
+        report_progress(
+            app,
+            "fabric",
+            format!("Fabric Loader {loader} profile ready"),
+            1,
+            1,
+            22,
+        );
+    }
     Ok(profile_id)
 }
 
@@ -1157,7 +1263,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
         copy_overrides(&pack_path, &instance_dir, app)?;
         let client = downloader()?;
         let profile_id = install_version_metadata(
-            app,
+            Some(app),
             &client,
             &instance_dir,
             &minecraft_version,
@@ -1256,7 +1362,10 @@ mod tests {
             return;
         }
         let manifest = read_manifest(pack).expect("Bee ZIP manifest should parse");
-        let (_, _) = validate_manifest(&manifest).expect("Bee ZIP manifest should be supported");
+        let (minecraft, fabric) =
+            validate_manifest(&manifest).expect("Bee ZIP manifest should be supported");
+        assert_eq!(minecraft, "26.3");
+        assert_eq!(fabric.as_deref(), Some("0.19.5"));
         let entries = local_bundle_entries(pack, &manifest.files)
             .expect("bundle entries should match the manifest");
         assert_eq!(entries.len(), manifest.files.len());
@@ -1280,6 +1389,62 @@ mod tests {
             manifest.files.len()
         );
         fs::remove_dir_all(destination).expect("temporary test folder should be removed");
+    }
+
+    #[test]
+    fn uses_only_official_mojang_hosts_for_version_metadata_fallbacks() {
+        let sources = mojang_version_metadata_sources(
+            "https://piston-meta.mojang.com/v1/packages/hash/26.3.json",
+        )
+        .expect("pinned metadata should use an official Mojang host");
+        assert_eq!(
+            sources,
+            [
+                "https://piston-meta.mojang.com/v1/packages/hash/26.3.json",
+                "https://launchermeta.mojang.com/v1/packages/hash/26.3.json"
+            ]
+        );
+        assert!(mojang_version_metadata_sources("https://example.invalid/26.3.json").is_err());
+        assert!(MINECRAFT_VERSION_MANIFEST_URLS
+            .iter()
+            .all(|url| url.starts_with("https://")));
+    }
+
+    #[test]
+    #[ignore = "requires live Mojang and Fabric metadata services"]
+    fn installs_minecraft_26_3_and_fabric_loader_0_19_5_in_a_separate_profile() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("bee-fabric-26-3-test-{unique}"));
+        fs::create_dir_all(&directory).expect("temporary profile folder should be created");
+        let client = super::super::downloader().expect("HTTP client should initialize");
+        let profile_id =
+            install_version_metadata(None, &client, &directory, "26.3", Some("0.19.5"))
+                .expect("Minecraft and Fabric metadata should install");
+        assert_eq!(profile_id, "fabric-loader-0.19.5-26.3");
+        let minecraft = fs::read_to_string(directory.join("versions/26.3/26.3.json"))
+            .expect("Minecraft 26.3 metadata should be installed");
+        let minecraft: Value = serde_json::from_str(&minecraft).expect("Minecraft JSON is valid");
+        assert_eq!(minecraft.get("id").and_then(Value::as_str), Some("26.3"));
+        let fabric_path = directory
+            .join("versions")
+            .join(&profile_id)
+            .join(format!("{profile_id}.json"));
+        let fabric: Value = serde_json::from_slice(
+            &fs::read(fabric_path).expect("Fabric profile metadata should be installed"),
+        )
+        .expect("Fabric JSON is valid");
+        assert_eq!(
+            fabric.get("id").and_then(Value::as_str),
+            Some(profile_id.as_str())
+        );
+        assert_eq!(
+            fabric.get("inheritsFrom").and_then(Value::as_str),
+            Some("26.3")
+        );
+        fs::remove_dir_all(directory).expect("temporary profile folder should be removed");
     }
 
     #[test]
