@@ -3,7 +3,7 @@ Unicode true
 !include "LogicLib.nsh"
 
 !define PRODUCT_NAME "Bee Launcher"
-!define PRODUCT_VERSION "0.1.18"
+!define PRODUCT_VERSION "0.1.20"
 !define PRODUCT_PUBLISHER "Bee Launcher"
 !define APP_EXE "../target/x86_64-pc-windows-msvc/release/blockline-launcher.exe"
 !define APP_ICON "../icons/icon.ico"
@@ -11,7 +11,7 @@ Unicode true
 !define SHORTCUT_METADATA_SCRIPT "SetShortcutAppId.ps1"
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-  OutFile "../../Bee-Launcher-Setup-0.1.18.exe"
+  OutFile "../../Bee-Launcher-Setup-0.1.20.exe"
 InstallDir "$LOCALAPPDATA\Programs\Bee Launcher"
 InstallDirRegKey HKCU "Software\BlocklineLauncher" "InstallDir"
 RequestExecutionLevel user
