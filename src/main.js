@@ -305,7 +305,7 @@ function renderVersions() {
   const canLaunch = Boolean(selected?.launchable) && javaReady;
   $('#play-button').disabled = busy || !canLaunch;
   $('#quick-play').disabled = busy || !canLaunch;
-  $('#vn').textContent = selected ? (selected.instanceName ? `${selected.instanceName} · ${selected.id}` : selected.id) : 'No profile selected';
+  $('#vn').textContent = selected ? (selected.instanceName || selected.id) : 'No profile selected';
   const kindLabel = displayKind(selected?.kind);
   const javaLabel = selected?.requiredJavaMajor ? `Java ${selected.requiredJavaMajor}` : 'Java';
   $('#vv').textContent = selected ? `${kindLabel}${selected.instanceName ? ' · Imported pack' : ''} · ${selected.launchable ? (javaReady ? 'Ready' : `${javaLabel} needed`) : 'Files incomplete'}` : 'Local profile';
@@ -368,7 +368,7 @@ function renderImportedPacks() {
     selectedVersion = button.dataset.selectProfile;
     openPanel('play');
     renderVersions();
-    notify('Modpack profile selected. Press Play when it is ready.');
+    notify('Profile selected.', 2600);
   }));
 }
 
