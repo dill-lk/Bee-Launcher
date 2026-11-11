@@ -516,7 +516,7 @@ function openPanel(name, title = '') {
       <div class="skin-heading"><div class="section-intro"><h3>Your skin library</h3><p>Add a Minecraft skin PNG for the launcher avatar, or apply it in-game when CustomSkinLoader is installed.</p></div><button class="btn pri" id="skin-add">Add skin PNG</button></div>
       <div class="skin-support" id="skin-support-status" role="status" aria-live="polite"></div>
       <div class="custom-skin-grid" id="custom-skin-grid"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's documented LocalSkin folder and work locally in offline play; other players will not see them. Bee Launcher does not sign in, upload skins, install/update mods, or edit worlds, profile JSON, or auth data. If a same-name LocalSkin already exists, Bee Launcher backs it up in its own app-data folder before replacing it. Removing a skin from this library does not delete an already-applied LocalSkin file.</span></div>`;
+      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's LocalSkin folder and work only on this client; other players will not see them. On first apply, Bee moves LocalSkin ahead of online skin sources because CustomSkinLoader's default order can ignore the local file. Existing CustomSkinLoader settings are backed up in Bee Launcher app data before that change; if the mod has not created its config yet, Bee stages a one-use ExtraList entry. Fully quit and restart Minecraft once so the mod reads the corrected order. Bee does not sign in, upload skins, install/update mods, or change worlds, profile JSON, or authentication. Same-name LocalSkin images are backed up before replacement, and removing a library skin does not delete an already-applied file.</span></div>`;
     renderCustomSkins();
     refreshCustomSkinSupport();
     $('#skin-add').addEventListener('click', addCustomSkin);
@@ -983,7 +983,11 @@ async function applyCustomSkinToMinecraft(skinId) {
       skinId,
     });
     const backupNote = result.replacedExisting ? ' The previous local skin was backed up in Bee Launcher app data.' : '';
-    notify(`Skin applied for offline player ${result.username}. Reopen the world to refresh it; other players will not see this local skin.${backupNote}`, 9000);
+    const configBackupNote = result.configBackupCreated ? ' The previous CustomSkinLoader config was backed up in Bee Launcher app data.' : '';
+    const refreshNote = result.restartRequired
+      ? ' Fully quit Minecraft and start it again once so CustomSkinLoader reads the LocalSkin-first order.'
+      : ' LocalSkin is already first; leave the current world and reopen it to refresh the skin.';
+    notify(`Skin file applied for offline player ${result.username}.${refreshNote} Other players will not see this local skin.${backupNote}${configBackupNote}`, 11000);
   } catch (error) {
     notify(`Could not apply this in-game skin: ${error}`, 10000);
   }

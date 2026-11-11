@@ -86,6 +86,8 @@ struct SkinApplyResult {
     username: String,
     profile_id: String,
     replaced_existing: bool,
+    restart_required: bool,
+    config_backup_created: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1088,11 +1090,219 @@ fn custom_skin_support_for_profile(game_dir: &Path, version_id: &str) -> CustomS
     CustomSkinSupport {
         supported: compatible,
         reason: if compatible {
-            "CustomSkinLoader is ready. Applying a skin only adds its local PNG to the mod's LocalSkin folder.".to_string()
+            "CustomSkinLoader is ready. Applying a skin adds its local PNG and ensures LocalSkin is first in the load order, backing up an existing config before changing it.".to_string()
         } else {
             format!("CustomSkinLoader {loader_version} was found, but Minecraft 26.3 needs version 15.1 or newer. Bee Launcher will not replace or update the mod.")
         },
         loader_version: Some(loader_version),
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalSkinConfigUpdate {
+    restart_required: bool,
+    backup_created: bool,
+}
+
+fn default_local_skin_profile() -> Value {
+    serde_json::json!({
+        "name": "LocalSkin",
+        "type": "Legacy",
+        "checkPNG": false,
+        "skin": "LocalSkin/skins/{USERNAME}.png",
+        "model": "auto",
+        "cape": "LocalSkin/capes/{USERNAME}.png",
+        "elytra": "LocalSkin/elytras/{USERNAME}.png"
+    })
+}
+
+fn prioritize_local_skin_profile(config: &mut Value) -> Result<bool, String> {
+    let root = config.as_object_mut().ok_or_else(|| {
+        "CustomSkinLoader's config is not a JSON object; it was left unchanged.".to_string()
+    })?;
+    let list = root
+        .entry("loadlist".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if list.is_null() {
+        *list = Value::Array(Vec::new());
+    }
+    let profiles = list.as_array_mut().ok_or_else(|| {
+        "CustomSkinLoader's loadlist is not a JSON array; its config was left unchanged."
+            .to_string()
+    })?;
+    let original = profiles.clone();
+    let local_index = profiles.iter().position(|profile| {
+        profile
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("LocalSkin"))
+    });
+    let mut local = local_index
+        .map(|index| profiles.remove(index))
+        .unwrap_or_else(default_local_skin_profile);
+    let local_object = local.as_object_mut().ok_or_else(|| {
+        "CustomSkinLoader's LocalSkin entry is invalid; its config was left unchanged.".to_string()
+    })?;
+    local_object.insert("name".to_string(), Value::String("LocalSkin".to_string()));
+    local_object.insert("type".to_string(), Value::String("Legacy".to_string()));
+    local_object.insert(
+        "skin".to_string(),
+        Value::String("LocalSkin/skins/{USERNAME}.png".to_string()),
+    );
+    local_object
+        .entry("model".to_string())
+        .or_insert_with(|| Value::String("auto".to_string()));
+    local_object
+        .entry("checkPNG".to_string())
+        .or_insert(Value::Bool(false));
+    local_object
+        .entry("cape".to_string())
+        .or_insert_with(|| Value::String("LocalSkin/capes/{USERNAME}.png".to_string()));
+    local_object
+        .entry("elytra".to_string())
+        .or_insert_with(|| Value::String("LocalSkin/elytras/{USERNAME}.png".to_string()));
+    profiles.insert(0, local);
+    Ok(*profiles != original)
+}
+
+fn bee_launcher_extra_local_skin_profile() -> Value {
+    serde_json::json!({
+        "name": "BeeLauncherLocalSkin",
+        "type": "Legacy",
+        "checkPNG": false,
+        "skin": "LocalSkin/skins/{USERNAME}.png",
+        "model": "auto",
+        "cape": "BeeLauncherLocalSkin/capes/{USERNAME}.png",
+        "elytra": "BeeLauncherLocalSkin/elytras/{USERNAME}.png"
+    })
+}
+
+fn has_pending_local_skin_extra_list(directory: &Path) -> bool {
+    fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .any(|entry| {
+            fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| {
+                    value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|name| name == "BeeLauncherLocalSkin")
+        })
+}
+
+fn stage_local_skin_extra_list(game_dir: &Path) -> Result<(), String> {
+    let extra_list = game_dir.join("CustomSkinLoader").join("ExtraList");
+    fs::create_dir_all(&extra_list).map_err(|error| {
+        format!("Could not prepare CustomSkinLoader's ExtraList folder: {error}")
+    })?;
+    if has_pending_local_skin_extra_list(&extra_list) {
+        return Ok(());
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = extra_list.join(format!("bee-launcher-localskin-{timestamp}.json"));
+    let bytes = serde_json::to_vec_pretty(&bee_launcher_extra_local_skin_profile())
+        .map_err(|error| format!("Could not encode CustomSkinLoader's LocalSkin entry: {error}"))?;
+    fs::write(path, bytes)
+        .map_err(|error| format!("Could not stage CustomSkinLoader's LocalSkin priority: {error}"))
+}
+
+fn backup_custom_skin_loader_config(
+    backup_directory: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(backup_directory).map_err(|error| {
+        format!("Could not create a safe CustomSkinLoader config backup folder: {error}")
+    })?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = backup_directory.join(format!("customskinloader-config-{timestamp}.json"));
+    fs::write(&backup, bytes).map_err(|error| {
+        format!("Could not back up CustomSkinLoader's config; it was left unchanged: {error}")
+    })?;
+    Ok(backup)
+}
+
+fn write_custom_skin_loader_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".CustomSkinLoader-{timestamp}.tmp"));
+    fs::write(&temporary, bytes).map_err(|error| {
+        format!("Could not prepare the CustomSkinLoader config update: {error}")
+    })?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "Could not safely update CustomSkinLoader's config: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_custom_skin_loader_local_skin_first(
+    game_dir: &Path,
+    backup_directory: &Path,
+) -> Result<LocalSkinConfigUpdate, String> {
+    let loader_directory = game_dir.join("CustomSkinLoader");
+    let config_path = loader_directory.join("CustomSkinLoader.json");
+    match fs::symlink_metadata(&config_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            stage_local_skin_extra_list(game_dir)?;
+            Ok(LocalSkinConfigUpdate {
+                restart_required: true,
+                backup_created: false,
+            })
+        }
+        Err(error) => Err(format!(
+            "Could not inspect CustomSkinLoader's config: {error}"
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            "CustomSkinLoader's config is not a regular file; it was left unchanged.".to_string(),
+        ),
+        Ok(metadata) if metadata.len() > 8 * 1024 * 1024 => Err(
+            "CustomSkinLoader's config is larger than expected, so it was left unchanged."
+                .to_string(),
+        ),
+        Ok(_) => {
+            let original = fs::read(&config_path)
+                .map_err(|error| format!("Could not read CustomSkinLoader's config: {error}"))?;
+            let mut config: Value = serde_json::from_slice(&original).map_err(|error| {
+                format!("CustomSkinLoader's config is not valid JSON, so it was left unchanged: {error}")
+            })?;
+            if !prioritize_local_skin_profile(&mut config)? {
+                return Ok(LocalSkinConfigUpdate::default());
+            }
+            let backup = backup_custom_skin_loader_config(backup_directory, &original)?;
+            let mut updated = serde_json::to_vec_pretty(&config)
+                .map_err(|error| format!("Could not encode CustomSkinLoader's config: {error}"))?;
+            updated.push(b'\n');
+            write_custom_skin_loader_config(&config_path, &updated)
+                .map_err(|error| format!("{error}. A backup was saved at {}.", backup.display()))?;
+            Ok(LocalSkinConfigUpdate {
+                restart_required: true,
+                backup_created: true,
+            })
+        }
     }
 }
 
@@ -1163,6 +1373,19 @@ fn apply_custom_skin_to_profile(
     let temporary = skin_directory.join(format!(".bee-skin-{timestamp}.tmp"));
     fs::write(&temporary, skin_bytes)
         .map_err(|error| format!("Could not prepare the local skin: {error}"))?;
+    let settings_path = config_file(&app)?;
+    let backup_directory = settings_path
+        .parent()
+        .ok_or_else(|| "Could not find the launcher data folder.".to_string())?
+        .join("custom-skin-backups");
+    let loader_config =
+        match ensure_custom_skin_loader_local_skin_first(&game_dir, &backup_directory) {
+            Ok(update) => update,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
     if backup.is_some() {
         fs::remove_file(&target)
             .map_err(|error| format!("Could not replace the existing LocalSkin: {error}"))?;
@@ -1178,6 +1401,8 @@ fn apply_custom_skin_to_profile(
         username,
         profile_id: version_id,
         replaced_existing: backup.is_some(),
+        restart_required: loader_config.restart_required,
+        config_backup_created: loader_config.backup_created,
     })
 }
 
@@ -2969,7 +3194,8 @@ mod tests {
 #[cfg(test)]
 mod custom_skin_tests {
     use super::{
-        installed_custom_skin_loader_version, parse_custom_skin_loader_version, read_skin_png,
+        ensure_custom_skin_loader_local_skin_first, installed_custom_skin_loader_version,
+        parse_custom_skin_loader_version, prioritize_local_skin_profile, read_skin_png,
         safe_skin_id,
     };
     use std::{
@@ -3028,6 +3254,117 @@ mod custom_skin_tests {
         assert!(safe_skin_id("skin-123-example.png"));
         assert!(!safe_skin_id("../skin-123-example.png"));
         assert!(!safe_skin_id("skin-123-example.jpg"));
+    }
+
+    #[test]
+    fn local_skin_is_moved_first_without_discarding_other_config() {
+        let mut config = serde_json::json!({
+            "threadPoolSize": 6,
+            "loadlist": [
+                { "name": "Mojang", "type": "MojangAPI" },
+                { "name": "LocalSkin", "type": "Legacy", "skin": "wrong/path.png", "cape": "custom-cape", "custom": "kept" },
+                { "name": "Other", "type": "Legacy" }
+            ]
+        });
+        assert!(prioritize_local_skin_profile(&mut config).unwrap());
+        assert_eq!(config["threadPoolSize"], 6);
+        assert_eq!(config["loadlist"][0]["name"], "LocalSkin");
+        assert_eq!(config["loadlist"][0]["type"], "Legacy");
+        assert_eq!(
+            config["loadlist"][0]["skin"],
+            "LocalSkin/skins/{USERNAME}.png"
+        );
+        assert_eq!(config["loadlist"][0]["cape"], "custom-cape");
+        assert_eq!(config["loadlist"][0]["custom"], "kept");
+        assert_eq!(config["loadlist"][1]["name"], "Mojang");
+        assert_eq!(config["loadlist"][2]["name"], "Other");
+    }
+
+    #[test]
+    fn local_skin_already_first_needs_no_config_change() {
+        let mut config = serde_json::json!({
+            "loadlist": [
+                {
+                    "name": "LocalSkin",
+                    "type": "Legacy",
+                    "skin": "LocalSkin/skins/{USERNAME}.png",
+                    "model": "auto",
+                    "checkPNG": false,
+                    "cape": "LocalSkin/capes/{USERNAME}.png",
+                    "elytra": "LocalSkin/elytras/{USERNAME}.png"
+                },
+                { "name": "Mojang", "type": "MojangAPI" }
+            ]
+        });
+        let before = config.clone();
+        assert!(!prioritize_local_skin_profile(&mut config).unwrap());
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn config_repair_refuses_a_non_array_loadlist() {
+        let mut config = serde_json::json!({ "loadlist": "not an array" });
+        let before = config.clone();
+        assert!(prioritize_local_skin_profile(&mut config).is_err());
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn config_repair_backs_up_the_original_and_moves_localskin_first() {
+        let root = test_skin_path("config-backup").with_extension("");
+        let game_dir = root.join("game");
+        let backup_dir = root.join("launcher-backups");
+        let loader_dir = game_dir.join("CustomSkinLoader");
+        fs::create_dir_all(&loader_dir).unwrap();
+        let config_path = loader_dir.join("CustomSkinLoader.json");
+        let original = br#"{"loadlist":[{"name":"Mojang","type":"MojangAPI"},{"name":"LocalSkin","type":"Legacy"}],"threadPoolSize":4}"#;
+        fs::write(&config_path, original).unwrap();
+
+        let update = ensure_custom_skin_loader_local_skin_first(&game_dir, &backup_dir).unwrap();
+        assert!(update.restart_required);
+        assert!(update.backup_created);
+        let backup = fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), original);
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["loadlist"][0]["name"], "LocalSkin");
+        assert_eq!(config["loadlist"][1]["name"], "Mojang");
+        assert_eq!(config["threadPoolSize"], 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_custom_skin_loader_config_stages_a_first_run_extra_list() {
+        let root = test_skin_path("config-missing").with_extension("");
+        let game_dir = root.join("game");
+        let backup_dir = root.join("launcher-backups");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        let update = ensure_custom_skin_loader_local_skin_first(&game_dir, &backup_dir).unwrap();
+        assert!(update.restart_required);
+        assert!(!update.backup_created);
+        assert!(!backup_dir.exists());
+        let extra_dir = game_dir.join("CustomSkinLoader/ExtraList");
+        let helper = fs::read_dir(&extra_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .unwrap();
+        let profile: serde_json::Value =
+            serde_json::from_slice(&fs::read(helper).unwrap()).unwrap();
+        assert_eq!(profile["name"], "BeeLauncherLocalSkin");
+        assert_eq!(profile["type"], "Legacy");
+        assert_eq!(profile["skin"], "LocalSkin/skins/{USERNAME}.png");
+        let repeated = ensure_custom_skin_loader_local_skin_first(&game_dir, &backup_dir).unwrap();
+        assert!(repeated.restart_required);
+        assert_eq!(fs::read_dir(extra_dir).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
