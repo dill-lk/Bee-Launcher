@@ -9,6 +9,7 @@ import trailsWallpaper from './assets/ui-trails-tales.jpg';
 import bridgeWallpaper from './assets/ui-golem-bridge.jpg';
 import sunsetWallpaper from './assets/ui-sunset-bridge.jpg';
 import originalWallpaper from './assets/worldscape.png';
+import { initializeSkinPreview, setSkinPreview } from './skinPreview.js';
 import './style.css';
 
 const $ = (selector) => document.querySelector(selector);
@@ -56,6 +57,9 @@ const avatarStorageKey = 'blockline.playerAvatar';
 let appearance = loadAppearance();
 let appStatus = { gameDirectory: '', installedVersions: [], javaAvailable: false };
 let settings = { maxMemoryGb: 4, width: 1280, height: 720, fullscreen: false, wallpaperPath: null, wallpaperName: null };
+let customSkins = [];
+let activeSkinId = null;
+let customSkinSupport = { supported: false, reason: 'Select a Fabric 26.3 profile to check CustomSkinLoader.', loaderVersion: null, checked: false };
 let toastTimer;
 let busy = false;
 let selectedVersion = '';
@@ -205,7 +209,8 @@ const avatarSkin = ['Explorer', '#c68a5f', '#4a2f1b', '#3b6fd6'];
 const avatarPattern = ['hhhhhhhh', 'hhhhhhhh', 'hsssssss', 'sessssse', 'ssssssss', 'sssmmsss', 'ssssssss', 'ssssssss'];
 
 function renderAvatar() {
-  const avatar = localStorage.getItem(avatarStorageKey);
+  const activeSkin = customSkins.find((skin) => skin.id === activeSkinId);
+  const avatar = activeSkin?.faceDataUrl || localStorage.getItem(avatarStorageKey);
   document.querySelectorAll('#me, #avatar-preview').forEach((face) => {
     face.replaceChildren();
     if (avatar) {
@@ -383,6 +388,7 @@ async function refreshStatus(showMessage = false) {
   try {
     appStatus = await invoke('app_status');
     renderStatus();
+    if (activePanel === 'skins') refreshCustomSkinSupport();
     if (showMessage) {
       const ready = appStatus.installedVersions.filter((version) => version.launchable).length;
       notify(`${appStatus.installedVersions.length} profile${appStatus.installedVersions.length === 1 ? '' : 's'} detected · ${ready} ready to launch.`);
@@ -482,7 +488,8 @@ function openPanel(name, title = '') {
   updateNav(name === 'settings' ? 'play' : name);
   if (name === 'play') return;
   sheet.classList.add('on');
-  sheet.classList.toggle('big', name === 'settings' || name === 'inst' || name === 'mods');
+  sheet.classList.toggle('big', name === 'settings' || name === 'inst' || name === 'mods' || name === 'skins');
+  sheet.classList.toggle('skin-panel', name === 'skins');
   if (name === 'settings') {
     sheet.classList.add('settings-panel');
     sheet.innerHTML = settingsMarkup();
@@ -504,10 +511,18 @@ function openPanel(name, title = '') {
       <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);
     renderImportedPacks();
+  } else if (name === 'skins') {
+    sheet.innerHTML = `${panelHeader('Custom skins', 'Local skins for your Bee profile')}
+      <div class="skin-heading"><div class="section-intro"><h3>Your skin library</h3><p>Add a Minecraft skin PNG for the launcher avatar, or apply it in-game when CustomSkinLoader is installed.</p></div><button class="btn pri" id="skin-add">Add skin PNG</button></div>
+      <div class="skin-support" id="skin-support-status" role="status" aria-live="polite"></div>
+      <div class="custom-skin-grid" id="custom-skin-grid"></div>
+      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's documented LocalSkin folder and work locally in offline play; other players will not see them. Bee Launcher does not sign in, upload skins, install/update mods, or edit worlds, profile JSON, or auth data. If a same-name LocalSkin already exists, Bee Launcher backs it up in its own app-data folder before replacing it. Removing a skin from this library does not delete an already-applied LocalSkin file.</span></div>`;
+    renderCustomSkins();
+    refreshCustomSkinSupport();
+    $('#skin-add').addEventListener('click', addCustomSkin);
   } else {
     const messages = {
       realms: 'Realms is not available in this local launcher. It only starts profiles already installed on this device.',
-      skins: 'Skin upload and account sync are not available in offline profile mode. Set the local player name in Settings.',
       servers: 'This local launcher does not browse or join servers. Online play requiring Microsoft or TLauncher authentication is unsupported.',
       notes: 'This local build does not load or invent Minecraft patch notes. Use the Minecraft website or official launcher for current release notes.',
     };
@@ -818,6 +833,162 @@ async function pickAvatar() {
   }
 }
 
+async function skinFacePreview(dataUrl) {
+  const image = new Image();
+  image.src = dataUrl;
+  await image.decode();
+  if (image.naturalWidth !== 64 || ![32, 64].includes(image.naturalHeight)) {
+    throw new Error('Skin PNGs must be 64×64, or the older 64×32 format.');
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 64;
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Could not create a skin preview.');
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 8, 8, 8, 8, 0, 0, 64, 64);
+  context.drawImage(image, 40, 8, 8, 8, 0, 0, 64, 64);
+  return canvas.toDataURL('image/png');
+}
+
+async function loadCustomSkins() {
+  try {
+    const library = await invoke('list_custom_skins');
+    customSkins = await Promise.all((library.skins || []).map(async (skin) => {
+      try {
+        return { ...skin, faceDataUrl: await skinFacePreview(skin.dataUrl) };
+      } catch (error) {
+        console.warn(`Could not preview custom skin ${skin.name}:`, error);
+        return skin;
+      }
+    }));
+    activeSkinId = customSkins.some((skin) => skin.id === library.activeSkinId) ? library.activeSkinId : null;
+    renderAvatar();
+    refreshSkinPreview();
+    renderCustomSkins();
+  } catch (error) {
+    console.warn('Could not load custom skins:', error);
+  }
+}
+
+function refreshSkinPreview() {
+  const skin = customSkins.find((item) => item.id === activeSkinId);
+  setSkinPreview(skin?.dataUrl || null, skin?.name || 'Default skin');
+}
+
+function renderCustomSkins() {
+  const grid = $('#custom-skin-grid');
+  if (!grid) return;
+  const status = $('#skin-support-status');
+  const validName = validatePlayerName(playerName());
+  const supportReason = validName ? customSkinSupport.reason : 'Set a valid 3–16 character player name in Settings before applying a skin in-game.';
+  const canApplyInGame = customSkinSupport.checked && customSkinSupport.supported && validName;
+  if (status) {
+    status.className = `skin-support${canApplyInGame ? ' ready' : ''}`;
+    status.textContent = supportReason;
+  }
+  if (!customSkins.length) {
+    grid.innerHTML = '<div class="skin-empty"><b>No custom skins yet</b><small>Add a 64×64 or legacy 64×32 PNG. Skins stay in Bee Launcher app data.</small></div>';
+    return;
+  }
+  grid.innerHTML = customSkins.map((skin) => {
+    const active = skin.id === activeSkinId;
+    return `<article class="skin-card"><img class="skin-texture" src="${escapeHtml(skin.dataUrl)}" alt="${escapeHtml(skin.name)} skin texture"><div class="skin-card-copy"><b>${escapeHtml(skin.name)}</b><small>Minecraft skin PNG · local library</small><div class="button-pair"><button class="btn ${active ? 'pri' : ''}" data-use-skin="${escapeHtml(skin.id)}" ${active ? 'disabled' : ''}>${active ? 'Launcher: in use' : 'Use in launcher'}</button><button class="btn skin-game" data-apply-skin="${escapeHtml(skin.id)}" title="${escapeHtml(supportReason)}" ${canApplyInGame ? '' : 'disabled'}>Use in Minecraft</button><button class="btn subtle" data-remove-skin="${escapeHtml(skin.id)}">Remove</button></div></div></article>`;
+  }).join('');
+  grid.querySelectorAll('[data-use-skin]').forEach((button) => button.addEventListener('click', () => activateCustomSkin(button.dataset.useSkin)));
+  grid.querySelectorAll('[data-apply-skin]').forEach((button) => button.addEventListener('click', () => applyCustomSkinToMinecraft(button.dataset.applySkin)));
+  grid.querySelectorAll('[data-remove-skin]').forEach((button) => button.addEventListener('click', () => removeCustomSkin(button.dataset.removeSkin)));
+}
+
+async function addCustomSkin() {
+  try {
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: 'Add a Minecraft skin PNG',
+      filters: [{ name: 'Minecraft skin', extensions: ['png'] }],
+    });
+    if (!selected) return;
+    const skin = await invoke('import_custom_skin', { path: selected });
+    skin.faceDataUrl = await skinFacePreview(skin.dataUrl);
+    customSkins = [...customSkins, skin].sort((left, right) => left.name.localeCompare(right.name));
+    activeSkinId = skin.id;
+    renderAvatar();
+    refreshSkinPreview();
+    renderCustomSkins();
+    notify(`${skin.name} added and used as your Bee Launcher profile picture.`);
+  } catch (error) {
+    notify(`Could not add that skin: ${error}`, 8000);
+  }
+}
+
+async function activateCustomSkin(skinId) {
+  try {
+    await invoke('set_active_custom_skin', { skinId });
+    activeSkinId = skinId;
+    renderAvatar();
+    refreshSkinPreview();
+    renderCustomSkins();
+    const skin = customSkins.find((item) => item.id === skinId);
+    notify(`${skin?.name || 'Skin'} is now your Bee Launcher profile picture.`);
+  } catch (error) {
+    notify(`Could not use that skin: ${error}`, 7000);
+  }
+}
+
+async function removeCustomSkin(skinId) {
+  try {
+    await invoke('remove_custom_skin', { skinId });
+    customSkins = customSkins.filter((skin) => skin.id !== skinId);
+    if (activeSkinId === skinId) activeSkinId = null;
+    renderAvatar();
+    refreshSkinPreview();
+    renderCustomSkins();
+    notify('Custom skin removed from Bee Launcher.');
+  } catch (error) {
+    notify(`Could not remove that skin: ${error}`, 7000);
+  }
+}
+
+async function refreshCustomSkinSupport() {
+  if (!selectedVersion) {
+    customSkinSupport = { supported: false, reason: 'Select a Fabric 26.3 profile from Play to check CustomSkinLoader.', loaderVersion: null, checked: false };
+    renderCustomSkins();
+    return;
+  }
+  customSkinSupport = { supported: false, reason: 'Checking the selected profile for CustomSkinLoader…', loaderVersion: null, checked: false };
+  renderCustomSkins();
+  try {
+    customSkinSupport = { ...(await invoke('get_custom_skin_support', { profileKey: selectedVersion })), checked: true };
+  } catch (error) {
+    customSkinSupport = { supported: false, reason: `Could not check this profile: ${error}`, loaderVersion: null, checked: true };
+  }
+  renderCustomSkins();
+}
+
+async function applyCustomSkinToMinecraft(skinId) {
+  const name = playerName();
+  if (!validatePlayerName(name)) {
+    notify('Set a valid 3–16 character player name in Settings first.');
+    showSettings();
+    return;
+  }
+  if (!selectedVersion) {
+    notify('Select a Fabric 26.3 profile from Play first.');
+    return;
+  }
+  try {
+    const result = await invoke('apply_custom_skin_to_profile', {
+      profileKey: selectedVersion,
+      username: name,
+      skinId,
+    });
+    const backupNote = result.replacedExisting ? ' The previous local skin was backed up in Bee Launcher app data.' : '';
+    notify(`Skin applied for offline player ${result.username}. Reopen the world to refresh it; other players will not see this local skin.${backupNote}`, 9000);
+  } catch (error) {
+    notify(`Could not apply this in-game skin: ${error}`, 10000);
+  }
+}
+
 function resetAvatar() {
   localStorage.removeItem(avatarStorageKey);
   renderAvatar();
@@ -884,6 +1055,7 @@ function toggleNews(force) {
 versionSelect.addEventListener('change', () => {
   selectedVersion = versionSelect.value;
   renderVersions();
+  if (activePanel === 'skins') refreshCustomSkinSupport();
 });
 $('#play-button').addEventListener('click', () => launchVersion(selectedVersion, 'Play'));
 $('#quick-play').addEventListener('click', () => launchVersion(selectedVersion, 'Quick Play'));
@@ -915,6 +1087,8 @@ sheet.addEventListener('click', (event) => {
 updateProfileName(playerName());
 applyAppearance();
 initializeReferenceArtwork();
+initializeSkinPreview($('#skin-canvas'), $('#skin-showcase'));
 applyStockWallpaper(appearance.wallpaper);
 refreshStatus();
 loadPreferences();
+loadCustomSkins();

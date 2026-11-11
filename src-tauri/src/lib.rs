@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
@@ -57,6 +57,37 @@ struct LaunchResult {
     log_path: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomSkin {
+    id: String,
+    name: String,
+    data_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkinLibrary {
+    active_skin_id: Option<String>,
+    skins: Vec<CustomSkin>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomSkinSupport {
+    supported: bool,
+    reason: String,
+    loader_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkinApplyResult {
+    username: String,
+    profile_id: String,
+    replaced_existing: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -68,6 +99,7 @@ struct StoredSettings {
     height: u32,
     fullscreen: bool,
     wallpaper_path: Option<String>,
+    active_skin_id: Option<String>,
 }
 
 impl Default for StoredSettings {
@@ -80,6 +112,7 @@ impl Default for StoredSettings {
             height: 720,
             fullscreen: false,
             wallpaper_path: None,
+            active_skin_id: None,
         }
     }
 }
@@ -767,6 +800,384 @@ fn read_local_image(path: String) -> Result<String, String> {
         error
             .replace("Wallpaper", "Image")
             .replace("wallpaper", "image")
+    })
+}
+
+fn custom_skin_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let config = config_file(app)?;
+    let parent = config
+        .parent()
+        .ok_or_else(|| "Could not find the launcher data folder.".to_string())?;
+    let directory = parent.join("custom-skins");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the custom skins folder: {error}"))?;
+    Ok(directory)
+}
+
+fn safe_skin_id(id: &str) -> bool {
+    id.starts_with("skin-")
+        && id.ends_with(".png")
+        && id.len() <= 120
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn skin_file(directory: &Path, id: &str) -> Result<PathBuf, String> {
+    if !safe_skin_id(id) {
+        return Err("That custom skin selection is not valid.".to_string());
+    }
+    Ok(directory.join(id))
+}
+
+fn read_skin_png(path: &Path) -> Result<Vec<u8>, String> {
+    if !path.is_file() {
+        return Err("That skin image could not be found.".to_string());
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !extension.eq_ignore_ascii_case("png") {
+        return Err("Minecraft skins must be PNG images.".to_string());
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not read skin image details: {error}"))?;
+    if metadata.len() > 2 * 1024 * 1024 {
+        return Err("Choose a skin PNG smaller than 2 MB.".to_string());
+    }
+    let bytes = fs::read(path).map_err(|error| format!("Could not read skin image: {error}"))?;
+    let decoder = png::Decoder::new(io::Cursor::new(bytes.as_slice()));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("That file is not a valid Minecraft skin PNG: {error}"))?;
+    let width = reader.info().width;
+    let height = reader.info().height;
+    if width != 64 || !matches!(height, 64 | 32) {
+        return Err("Skin PNGs must be 64×64, or the older 64×32 format.".to_string());
+    }
+    let output_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "That skin PNG is too large to decode.".to_string())?;
+    let mut decoded = vec![0; output_size];
+    reader
+        .next_frame(&mut decoded)
+        .map_err(|error| format!("Could not decode that skin PNG: {error}"))?;
+    Ok(bytes)
+}
+
+fn custom_skin_from_file(path: &Path, id: String) -> Result<CustomSkin, String> {
+    let bytes = read_skin_png(path)?;
+    let name_part = id
+        .strip_prefix("skin-")
+        .and_then(|value| value.split_once('-').map(|(_, name)| name))
+        .and_then(|value| value.strip_suffix(".png"))
+        .unwrap_or("custom");
+    let name = name_part
+        .replace('-', " ")
+        .replace('_', " ")
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(CustomSkin {
+        id,
+        name: if name.is_empty() {
+            "Custom skin".to_string()
+        } else {
+            name
+        },
+        data_url: format!("data:image/png;base64,{}", STANDARD.encode(bytes)),
+    })
+}
+
+#[tauri::command]
+fn list_custom_skins(app: AppHandle) -> Result<SkinLibrary, String> {
+    let directory = custom_skin_directory(&app)?;
+    let stored = read_stored_settings(&app);
+    let mut skins = fs::read_dir(&directory)
+        .map_err(|error| format!("Could not list custom skins: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !entry.file_type().ok()?.is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            {
+                return None;
+            }
+            let id = path.file_name()?.to_str()?.to_string();
+            if !safe_skin_id(&id) {
+                return None;
+            }
+            custom_skin_from_file(&path, id).ok()
+        })
+        .collect::<Vec<_>>();
+    skins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    let active_skin_id = stored
+        .active_skin_id
+        .filter(|id| safe_skin_id(id) && directory.join(id).is_file());
+    Ok(SkinLibrary {
+        active_skin_id,
+        skins,
+    })
+}
+
+#[tauri::command]
+fn import_custom_skin(app: AppHandle, path: String) -> Result<CustomSkin, String> {
+    let source = PathBuf::from(path);
+    let bytes = read_skin_png(&source)?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("custom");
+    let slug = stem
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '-' || *character == '_'
+        })
+        .take(48)
+        .collect::<String>();
+    let slug = if slug.is_empty() {
+        "custom"
+    } else {
+        slug.as_str()
+    };
+    let directory = custom_skin_directory(&app)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut id = format!("skin-{timestamp}-{slug}.png");
+    let mut suffix = 0_u32;
+    while directory.join(&id).exists() {
+        suffix += 1;
+        id = format!("skin-{timestamp}-{suffix}-{slug}.png");
+    }
+    let destination = skin_file(&directory, &id)?;
+    fs::write(&destination, &bytes)
+        .map_err(|error| format!("Could not save this skin in Bee Launcher: {error}"))?;
+    let mut stored = read_stored_settings(&app);
+    stored.active_skin_id = Some(id.clone());
+    if let Err(error) = write_stored_settings(&app, &stored) {
+        let _ = fs::remove_file(&destination);
+        return Err(error);
+    }
+    custom_skin_from_file(&destination, id)
+}
+
+#[tauri::command]
+fn set_active_custom_skin(app: AppHandle, skin_id: Option<String>) -> Result<(), String> {
+    let directory = custom_skin_directory(&app)?;
+    if let Some(id) = skin_id.as_deref() {
+        let path = skin_file(&directory, id)?;
+        if !path.is_file() {
+            return Err("That custom skin is no longer available.".to_string());
+        }
+        read_skin_png(&path)?;
+    }
+    let mut stored = read_stored_settings(&app);
+    stored.active_skin_id = skin_id;
+    write_stored_settings(&app, &stored)
+}
+
+#[tauri::command]
+fn remove_custom_skin(app: AppHandle, skin_id: String) -> Result<(), String> {
+    let directory = custom_skin_directory(&app)?;
+    let path = skin_file(&directory, &skin_id)?;
+    if !path.is_file() {
+        return Err("That custom skin is no longer available.".to_string());
+    }
+    let mut stored = read_stored_settings(&app);
+    if stored.active_skin_id.as_deref() == Some(skin_id.as_str()) {
+        stored.active_skin_id = None;
+        write_stored_settings(&app, &stored)?;
+    }
+    fs::remove_file(path).map_err(|error| format!("Could not remove this custom skin: {error}"))
+}
+
+fn parse_custom_skin_loader_version(version: &str) -> Option<(u32, u32, u32)> {
+    let mut numbers = version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    Some((
+        numbers.next()?,
+        numbers.next().unwrap_or(0),
+        numbers.next().unwrap_or(0),
+    ))
+}
+
+fn installed_custom_skin_loader_version(game_dir: &Path) -> Option<String> {
+    let mods = game_dir.join("mods");
+    let mut versions = fs::read_dir(mods)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+        })
+        .filter_map(|entry| {
+            let file = fs::File::open(entry.path()).ok()?;
+            let mut archive = zip::ZipArchive::new(file).ok()?;
+            let mut manifest = String::new();
+            archive
+                .by_name("fabric.mod.json")
+                .ok()?
+                .read_to_string(&mut manifest)
+                .ok()?;
+            let metadata: Value = serde_json::from_str(&manifest).ok()?;
+            let id = metadata.get("id")?.as_str()?;
+            if !id.starts_with("customskinloader") {
+                return None;
+            }
+            let version = metadata.get("version")?.as_str()?.to_string();
+            Some((parse_custom_skin_loader_version(&version)?, version))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by(|left, right| right.0.cmp(&left.0));
+    versions.into_iter().next().map(|(_, version)| version)
+}
+
+fn custom_skin_support_for_profile(game_dir: &Path, version_id: &str) -> CustomSkinSupport {
+    let Some(profile) = installed_versions(game_dir)
+        .into_iter()
+        .find(|profile| profile.id == version_id)
+    else {
+        return CustomSkinSupport {
+            supported: false,
+            reason:
+                "The selected profile could not be read. Rescan the Minecraft folder and try again."
+                    .to_string(),
+            loader_version: None,
+        };
+    };
+    if !profile.kind.eq_ignore_ascii_case("fabric") {
+        return CustomSkinSupport {
+            supported: false,
+            reason: "In-game local skins require the selected Fabric profile.".to_string(),
+            loader_version: None,
+        };
+    }
+    if profile.base_version.as_deref() != Some("26.3") {
+        return CustomSkinSupport {
+            supported: false,
+            reason: "In-game skin support is enabled for Minecraft 26.3 Fabric profiles."
+                .to_string(),
+            loader_version: None,
+        };
+    }
+    let Some(loader_version) = installed_custom_skin_loader_version(game_dir) else {
+        return CustomSkinSupport {
+            supported: false,
+            reason: "CustomSkinLoader is not installed in this profile's mods folder. Bee Launcher will not install or change mods.".to_string(),
+            loader_version: None,
+        };
+    };
+    let compatible = parse_custom_skin_loader_version(&loader_version)
+        .is_some_and(|version| version >= (15, 1, 0));
+    CustomSkinSupport {
+        supported: compatible,
+        reason: if compatible {
+            "CustomSkinLoader is ready. Applying a skin only adds its local PNG to the mod's LocalSkin folder.".to_string()
+        } else {
+            format!("CustomSkinLoader {loader_version} was found, but Minecraft 26.3 needs version 15.1 or newer. Bee Launcher will not replace or update the mod.")
+        },
+        loader_version: Some(loader_version),
+    }
+}
+
+#[tauri::command]
+fn get_custom_skin_support(
+    app: AppHandle,
+    profile_key: String,
+) -> Result<CustomSkinSupport, String> {
+    let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
+    Ok(custom_skin_support_for_profile(&game_dir, &version_id))
+}
+
+#[tauri::command]
+fn apply_custom_skin_to_profile(
+    app: AppHandle,
+    profile_key: String,
+    username: String,
+    skin_id: String,
+) -> Result<SkinApplyResult, String> {
+    validate_username(&username)?;
+    let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
+    let support = custom_skin_support_for_profile(&game_dir, &version_id);
+    if !support.supported {
+        return Err(support.reason);
+    }
+    let library = custom_skin_directory(&app)?;
+    let source = skin_file(&library, &skin_id)?;
+    let skin_bytes = read_skin_png(&source)?;
+    let skin_directory = game_dir
+        .join("CustomSkinLoader")
+        .join("LocalSkin")
+        .join("skins");
+    fs::create_dir_all(&skin_directory).map_err(|error| {
+        format!("Could not prepare CustomSkinLoader's local skin folder: {error}")
+    })?;
+    let target = skin_directory.join(format!("{username}.png"));
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(
+                    "Bee Launcher will not replace a non-regular file in the LocalSkin folder."
+                        .to_string(),
+                );
+            }
+            if metadata.len() > 8 * 1024 * 1024 {
+                return Err("The existing LocalSkin file is too large to back up safely, so it was left unchanged.".to_string());
+            }
+            let backup_directory = config_file(&app)?
+                .parent()
+                .ok_or_else(|| "Could not find the launcher data folder.".to_string())?
+                .join("custom-skin-backups");
+            fs::create_dir_all(&backup_directory)
+                .map_err(|error| format!("Could not create a safe backup folder: {error}"))?;
+            let backup_path =
+                backup_directory.join(format!("local-skin-{timestamp}-{username}.png"));
+            fs::copy(&target, &backup_path).map_err(|error| {
+                format!("Could not back up the existing LocalSkin; it was left unchanged: {error}")
+            })?;
+            Some(backup_path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Could not inspect the existing LocalSkin: {error}")),
+    };
+    let temporary = skin_directory.join(format!(".bee-skin-{timestamp}.tmp"));
+    fs::write(&temporary, skin_bytes)
+        .map_err(|error| format!("Could not prepare the local skin: {error}"))?;
+    if backup.is_some() {
+        fs::remove_file(&target)
+            .map_err(|error| format!("Could not replace the existing LocalSkin: {error}"))?;
+    }
+    if let Err(error) = fs::rename(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        if let Some(backup_path) = backup.as_ref() {
+            let _ = fs::copy(backup_path, &target);
+        }
+        return Err(format!("Could not install the local skin: {error}"));
+    }
+    Ok(SkinApplyResult {
+        username,
+        profile_id: version_id,
+        replaced_existing: backup.is_some(),
     })
 }
 
@@ -2555,6 +2966,95 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod custom_skin_tests {
+    use super::{
+        installed_custom_skin_loader_version, parse_custom_skin_loader_version, read_skin_png,
+        safe_skin_id,
+    };
+    use std::{
+        fs,
+        io::Write,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels = vec![0; (width * height * 4) as usize];
+            writer.write_image_data(&pixels).unwrap();
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn test_skin_path(label: &str) -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bee-skin-{timestamp}-{label}.png"))
+    }
+
+    #[test]
+    fn accepts_standard_and_legacy_skin_pngs() {
+        for height in [64, 32] {
+            let path = test_skin_path(&format!("height-{height}"));
+            write_png(&path, 64, height);
+            assert!(read_skin_png(&path).is_ok());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_dimensions_and_malformed_pngs() {
+        let wrong_size = test_skin_path("wrong-size");
+        write_png(&wrong_size, 64, 63);
+        assert!(read_skin_png(&wrong_size).unwrap_err().contains("64×64"));
+        fs::remove_file(wrong_size).unwrap();
+
+        let malformed = test_skin_path("malformed");
+        fs::write(&malformed, b"not a png").unwrap();
+        assert!(read_skin_png(&malformed).is_err());
+        fs::remove_file(malformed).unwrap();
+    }
+
+    #[test]
+    fn custom_skin_ids_cannot_escape_the_library_folder() {
+        assert!(safe_skin_id("skin-123-example.png"));
+        assert!(!safe_skin_id("../skin-123-example.png"));
+        assert!(!safe_skin_id("skin-123-example.jpg"));
+    }
+
+    #[test]
+    fn detects_official_custom_skin_loader_bootstrap_metadata_and_version() {
+        let root = test_skin_path("mods-root").with_extension("");
+        let mods = root.join("mods");
+        fs::create_dir_all(&mods).unwrap();
+        let jar = fs::File::create(mods.join("CustomSkinLoader_Universal-15.1.jar")).unwrap();
+        let mut archive = zip::ZipWriter::new(jar);
+        archive
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(br#"{"schemaVersion":1,"id":"customskinloader-bootstrap","version":"15.1"}"#)
+            .unwrap();
+        archive.finish().unwrap();
+
+        assert_eq!(
+            installed_custom_skin_loader_version(&root).as_deref(),
+            Some("15.1")
+        );
+        assert!(parse_custom_skin_loader_version("15.1") >= Some((15, 1, 0)));
+        assert!(parse_custom_skin_loader_version("15.0.1") < Some((15, 1, 0)));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(windows)]
 fn set_windows_app_user_model_id() {
     use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -2643,6 +3143,12 @@ pub fn run() {
             set_wallpaper,
             get_wallpaper_data,
             read_local_image,
+            list_custom_skins,
+            import_custom_skin,
+            set_active_custom_skin,
+            remove_custom_skin,
+            get_custom_skin_support,
+            apply_custom_skin_to_profile,
             reset_wallpaper,
             import_modpack,
             launch_version,

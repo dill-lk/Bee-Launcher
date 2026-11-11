@@ -367,6 +367,32 @@ body{font-size:15px}
 .settings-rail button{white-space:nowrap}
 @media(max-width:900px){.settings-layout{grid-template-columns:160px minmax(0,1fr)}.settings-rail button{font-size:14px}}
 
+.sheet.big.skin-panel{top:8%;width:min(900px,92%);max-height:84%;padding:18px 20px;overflow:hidden}
+.skin-panel>.sh{flex:none}
+.skin-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 12px}
+.skin-heading .section-intro{margin:0}
+.skin-heading .section-intro h3{font-size:21px}
+.skin-heading .section-intro p{font-size:14px}
+.skin-heading>.btn{flex:none}
+.custom-skin-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;min-height:0;max-height:44vh;overflow:auto;padding:1px 4px 4px 1px;scrollbar-color:rgba(255,255,255,.22) transparent;scrollbar-width:thin}
+.custom-skin-grid::-webkit-scrollbar{width:7px}
+.custom-skin-grid::-webkit-scrollbar-thumb{background:rgba(255,255,255,.22);border-radius:8px}
+.skin-card{display:grid;grid-template-columns:90px minmax(0,1fr);align-items:center;gap:13px;min-width:0;padding:10px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.035))}
+.skin-texture{display:block;width:90px;height:90px;object-fit:contain;image-rendering:pixelated;border:1px solid rgba(255,255,255,.1);border-radius:8px;background-color:rgba(0,0,0,.24);background-image:linear-gradient(45deg,rgba(255,255,255,.04) 25%,transparent 25%),linear-gradient(-45deg,rgba(255,255,255,.04) 25%,transparent 25%),linear-gradient(45deg,transparent 75%,rgba(255,255,255,.04) 75%),linear-gradient(-45deg,transparent 75%,rgba(255,255,255,.04) 75%);background-size:12px 12px;background-position:0 0,0 6px,6px -6px,-6px 0}
+.skin-card-copy{display:flex;flex-direction:column;align-items:flex-start;gap:5px;min-width:0}
+.skin-card-copy>b{max-width:100%;overflow-wrap:anywhere;font-size:16px}
+.skin-card-copy>small,.skin-empty>small{color:rgba(255,255,255,.7);font-size:12px;line-height:1.35}
+.skin-card-copy .button-pair{margin-top:4px}
+.skin-card-copy .btn{font-size:13px;padding:7px 10px}
+.skin-empty{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:18px;border:1px dashed rgba(255,255,255,.2);border-radius:12px;background:rgba(255,255,255,.035)}
+.skin-empty>b{font-size:16px}
+.skin-support{flex:none;margin:0 0 10px;padding:9px 12px;border:1px solid rgba(255,207,74,.2);border-left:2px solid #e8b955;border-radius:9px;background:rgba(226,173,61,.08);color:rgba(255,255,255,.85);font-size:13px;line-height:1.4}
+.skin-support.ready{border-color:rgba(112,229,140,.22);border-left-color:#70e58c;background:rgba(87,143,67,.12)}
+.skin-card-copy .skin-game:not(:disabled){border-color:rgba(112,229,140,.4);background:rgba(87,143,67,.16)}
+.skin-card-copy .skin-game:not(:disabled):hover{background:rgba(87,143,67,.3)}
+.skin-panel>.local-note{flex:none;margin-top:12px;font-size:13px}
+@media(max-width:680px){.sheet.big.skin-panel{padding:14px}.skin-heading{align-items:flex-start;flex-direction:column}.custom-skin-grid{grid-template-columns:1fr;max-height:40vh}.skin-card{grid-template-columns:76px minmax(0,1fr);gap:10px}.skin-texture{width:76px;height:76px}.skin-panel>.local-note{font-size:12px}}
+
 .pack-import-card{display:grid;grid-template-columns:1fr auto;align-items:center;gap:14px;padding:15px;margin:2px 0 18px;border:1px solid var(--edge);border-radius:11px;background:rgba(255,255,255,.07);box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
 .pack-import-copy b{display:block;font-size:14px}.pack-import-copy small{display:block;max-width:490px;margin-top:4px;color:var(--mute);font-size:12px;line-height:1.5}
 .pack-import-card>.btn{white-space:nowrap}.import-progress{grid-column:1/-1;display:grid;grid-template-columns:1fr auto;gap:7px 12px;align-items:center;padding-top:10px;border-top:1px solid rgba(255,255,255,.1)}
@@ -377,3 +403,18 @@ body{font-size:15px}
 .panel-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:12px}.panel-actions .btn{white-space:nowrap}
 .go[disabled],.btn[disabled]{opacity:.55;cursor:not-allowed}
 @media (max-width:760px){.pack-import-card{grid-template-columns:1fr}.pack-import-card>.btn{width:100%}.panel-actions{justify-content:stretch}.panel-actions .btn{flex:1}}
+
+
+/* Live 3D skin preview: transparent over the existing wallpaper and clear of the launch dock. */
+.skin-showcase{position:absolute;z-index:3;top:13%;right:2.5%;width:clamp(190px,23cqw,350px);height:61%;display:block;pointer-events:auto;touch-action:none;user-select:none}
+.skin-canvas{display:block;width:100%;height:100%;outline:none;cursor:grab;filter:drop-shadow(0 15px 20px rgba(0,0,0,.42))}
+.skin-showcase.is-turning .skin-canvas{cursor:grabbing}
+.skin-preview-caption{position:absolute;left:50%;bottom:1%;display:flex;flex-direction:column;align-items:center;gap:1px;max-width:92%;padding:5px 12px 6px;transform:translateX(-50%);border:1px solid rgba(255,255,255,.17);border-radius:999px;background:rgba(12,10,18,.48);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);text-align:center;white-space:nowrap;pointer-events:none;text-shadow:0 1px 4px #000}
+.skin-preview-caption b{max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:13px;line-height:1.1}
+.skin-preview-caption small{color:rgba(255,255,255,.83);font-size:10px;line-height:1.1}
+.skin-preview-fallback{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#fff;text-align:center;text-shadow:0 2px 6px #000}
+.skin-preview-fallback[hidden]{display:none}
+.skin-fallback-face{display:block;width:90px;height:90px;border:1px solid rgba(255,255,255,.4);border-radius:12px;background:var(--preview-skin) center/contain no-repeat;image-rendering:pixelated;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+.skin-preview-fallback small{padding:5px 9px;border-radius:8px;background:rgba(0,0,0,.46);font-size:11px}
+@media(max-width:760px){.skin-showcase{top:6%;right:1%;width:28%;height:38%}.skin-preview-caption{padding:4px 8px}.skin-preview-caption b{font-size:11px}.skin-preview-caption small{font-size:9px}}
+@media(prefers-reduced-motion:reduce){.skin-canvas{filter:none}}

@@ -182,10 +182,11 @@ dependencies = [
 
 [[package]]
 name = "blockline-launcher"
-version = "0.1.20"
+version = "0.1.22"
 dependencies = [
  "base64 0.22.1",
  "md5",
+ "png",
  "reqwest",
  "serde",
  "serde_json",
