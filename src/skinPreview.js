@@ -6,6 +6,7 @@ let fallback = null;
 let previewName = null;
 let resizeObserver = null;
 let targetLook = { x: 0, y: 0 };
+let loadGeneration = 0;
 
 function makeDefaultSkin() {
   const canvas = document.createElement('canvas');
@@ -51,11 +52,17 @@ function resizeViewer() {
   if (width !== viewer.width || height !== viewer.height) viewer.setSize(width, height);
 }
 
-export function initializeSkinPreview(canvas, host) {
+export async function initializeSkinPreview(canvas, host, initialSkin = null) {
   previewHost = host;
   fallback = host?.querySelector('#skin-preview-fallback') || null;
   previewName = host?.querySelector('#skin-preview-name') || null;
   if (!canvas || !host) return false;
+  const initialDataUrl = initialSkin?.dataUrl || makeDefaultSkin();
+  const initialName = initialSkin?.name || 'Default skin';
+  setFallbackSkin(initialDataUrl);
+  if (previewName) previewName.textContent = initialName;
+  host.classList.add('loading');
+  host.classList.remove('ready');
 
   try {
     const idle = new IdleAnimation();
@@ -76,7 +83,6 @@ export function initializeSkinPreview(canvas, host) {
       width: Math.max(1, Math.floor(host.clientWidth)),
       height: Math.max(1, Math.floor(host.clientHeight)),
       pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
-      skin: makeDefaultSkin(),
       model: 'auto-detect',
       fov: 42,
       zoom: 0.76,
@@ -113,26 +119,45 @@ export function initializeSkinPreview(canvas, host) {
     document.addEventListener('visibilitychange', () => {
       if (viewer) viewer.renderPaused = document.visibilityState === 'hidden';
     });
-    if (previewName) previewName.textContent = 'Default skin';
+    await viewer.loadSkin(initialDataUrl, { model: 'auto-detect' });
+    canvas.hidden = false;
     if (fallback) fallback.hidden = true;
+    host.classList.remove('loading');
+    host.classList.add('ready');
     return true;
   } catch (error) {
     console.warn('Could not initialize the 3D skin preview:', error);
     viewer = null;
     canvas.hidden = true;
     if (fallback) fallback.hidden = false;
+    host.classList.remove('loading');
+    host.classList.add('ready');
     return false;
   }
 }
 
-export function setSkinPreview(dataUrl, name = 'Default skin') {
+export async function setSkinPreview(dataUrl, name = 'Default skin') {
   const skin = dataUrl || makeDefaultSkin();
   setFallbackSkin(skin);
   if (previewName) previewName.textContent = name || 'Default skin';
   if (!viewer) return;
+  const generation = ++loadGeneration;
+  previewHost?.classList.add('loading');
   try {
-    viewer.loadSkin(skin, { model: 'auto-detect' });
+    await viewer.loadSkin(skin, { model: 'auto-detect' });
+    if (generation !== loadGeneration) return;
+    const canvas = previewHost?.querySelector('canvas');
+    if (canvas) canvas.hidden = false;
+    if (fallback) fallback.hidden = true;
+    previewHost?.classList.remove('loading');
+    previewHost?.classList.add('ready');
   } catch (error) {
     console.warn('Could not show the selected skin in 3D:', error);
+    if (generation !== loadGeneration) return;
+    const canvas = previewHost?.querySelector('canvas');
+    if (canvas) canvas.hidden = true;
+    if (fallback) fallback.hidden = false;
+    previewHost?.classList.remove('loading');
+    previewHost?.classList.add('ready');
   }
 }

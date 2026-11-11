@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -14,7 +14,9 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+mod crash_helper;
 mod modpack;
+mod world_backup;
 
 const LAUNCHER_NAME: &str = "Bee Launcher";
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +49,14 @@ struct AppStatus {
     installed_versions: Vec<InstalledVersion>,
     java_available: bool,
     java_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftNewsArticle {
+    title: String,
+    summary: String,
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +98,25 @@ struct SkinApplyResult {
     replaced_existing: bool,
     restart_required: bool,
     config_backup_created: bool,
+    skin_path: String,
+    loader_config_path: String,
+    staged_file_verified: bool,
+    load_order_ready: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkinApplicationVerification {
+    username: String,
+    profile_id: String,
+    skin_path: String,
+    loader_log_path: String,
+    file_matches_library: bool,
+    load_order_ready: bool,
+    loader_log_found: bool,
+    loader_log_updated_after_skin: bool,
+    matching_skin_fingerprint: bool,
+    load_confirmed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,6 +131,27 @@ struct StoredSettings {
     fullscreen: bool,
     wallpaper_path: Option<String>,
     active_skin_id: Option<String>,
+    profile_settings: HashMap<String, ProfileLaunchSettings>,
+    graphics_restore_points: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+struct ProfileLaunchSettings {
+    java_path: Option<String>,
+    max_memory_gb: Option<u8>,
+    graphics_preset: String,
+}
+
+impl Default for ProfileLaunchSettings {
+    fn default() -> Self {
+        Self {
+            java_path: None,
+            max_memory_gb: None,
+            graphics_preset: "default".to_string(),
+        }
+    }
 }
 
 impl Default for StoredSettings {
@@ -115,6 +165,8 @@ impl Default for StoredSettings {
             fullscreen: false,
             wallpaper_path: None,
             active_skin_id: None,
+            profile_settings: HashMap::new(),
+            graphics_restore_points: HashMap::new(),
         }
     }
 }
@@ -129,6 +181,7 @@ struct LauncherSettings {
     fullscreen: bool,
     wallpaper_path: Option<String>,
     wallpaper_name: Option<String>,
+    profile_settings: HashMap<String, ProfileLaunchSettings>,
 }
 
 fn ensure_version_id(version_id: &str) -> Result<(), String> {
@@ -545,6 +598,21 @@ fn java_major_version(candidate: &Path) -> Option<u32> {
     java_major_from_output(&text)
 }
 
+fn java_probe_path(candidate: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("javaw.exe"))
+    {
+        let console_runtime = candidate.with_file_name("java.exe");
+        if console_runtime.is_file() {
+            return console_runtime;
+        }
+    }
+    candidate.to_path_buf()
+}
+
 #[allow(unused_mut)]
 fn first_usable_java(mut candidates: Vec<PathBuf>, required_major: Option<u32>) -> Option<PathBuf> {
     let mut seen = HashSet::new();
@@ -716,6 +784,7 @@ fn launcher_settings(app: &AppHandle) -> Result<LauncherSettings, String> {
         fullscreen: stored.fullscreen,
         wallpaper_path: stored.wallpaper_path,
         wallpaper_name,
+        profile_settings: stored.profile_settings,
     })
 }
 
@@ -743,6 +812,55 @@ fn save_launcher_settings(
     stored.width = width;
     stored.height = height;
     stored.fullscreen = fullscreen;
+    write_stored_settings(&app, &stored)?;
+    launcher_settings(&app)
+}
+
+#[tauri::command]
+fn save_profile_launch_settings(
+    app: AppHandle,
+    profile_key: String,
+    profile_settings: ProfileLaunchSettings,
+) -> Result<LauncherSettings, String> {
+    if profile_settings
+        .max_memory_gb
+        .is_some_and(|memory| !(1..=16).contains(&memory))
+    {
+        return Err("Per-profile memory must be between 1 and 16 GB.".to_string());
+    }
+    if !matches!(
+        profile_settings.graphics_preset.as_str(),
+        "default" | "intel-uhd-low"
+    ) {
+        return Err("That graphics preset is not supported.".to_string());
+    }
+    let (profile_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
+    let chain = metadata_chain(&profile_dir, &version_id)?;
+    let required_major = chain
+        .iter()
+        .find_map(|(_, metadata)| required_java_major(metadata));
+    if let Some(path) = profile_settings.java_path.as_deref() {
+        let java = PathBuf::from(path);
+        if !java.is_file() {
+            return Err("That Java executable no longer exists. Choose another Java runtime or use automatic detection.".to_string());
+        }
+        let actual_major = java_major_version(&java_probe_path(&java))
+            .ok_or_else(|| "Bee Launcher could not read the selected Java version.".to_string())?;
+        if required_major.is_some_and(|required| required != actual_major) {
+            return Err(format!(
+                "This profile requires Java {}, but the selected runtime is Java {actual_major}.",
+                required_major.unwrap()
+            ));
+        }
+    }
+    let mut stored = read_stored_settings(&app);
+    if profile_settings == ProfileLaunchSettings::default() {
+        stored.profile_settings.remove(&profile_key);
+    } else {
+        stored
+            .profile_settings
+            .insert(profile_key, profile_settings);
+    }
     write_stored_settings(&app, &stored)?;
     launcher_settings(&app)
 }
@@ -1194,13 +1312,12 @@ fn has_pending_local_skin_extra_list(directory: &Path) -> bool {
             fs::read(entry.path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|value| {
-                    value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
+                .is_some_and(|profile| {
+                    profile.get("name").and_then(Value::as_str) == Some("BeeLauncherLocalSkin")
+                        && profile.get("type").and_then(Value::as_str) == Some("Legacy")
+                        && profile.get("skin").and_then(Value::as_str)
+                            == Some("LocalSkin/skins/{USERNAME}.png")
                 })
-                .is_some_and(|name| name == "BeeLauncherLocalSkin")
         })
 }
 
@@ -1306,6 +1423,75 @@ fn ensure_custom_skin_loader_local_skin_first(
     }
 }
 
+fn custom_skin_profile_matches_local_skin(profile: &Value) -> bool {
+    profile
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("Legacy"))
+        && profile.get("skin").and_then(Value::as_str) == Some("LocalSkin/skins/{USERNAME}.png")
+}
+
+fn local_skin_extra_list_is_ready(directory: &Path) -> bool {
+    fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .any(|entry| {
+            fs::metadata(entry.path())
+                .ok()
+                .is_some_and(|metadata| metadata.len() <= 1024 * 1024)
+                && fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|profile| {
+                        profile.get("name").and_then(Value::as_str) == Some("BeeLauncherLocalSkin")
+                            && custom_skin_profile_matches_local_skin(&profile)
+                    })
+        })
+}
+
+fn local_skin_priority_ready(game_dir: &Path) -> Result<bool, String> {
+    let config_path = game_dir
+        .join("CustomSkinLoader")
+        .join("CustomSkinLoader.json");
+    let extra_list = game_dir.join("CustomSkinLoader").join("ExtraList");
+    match fs::symlink_metadata(&config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("CustomSkinLoader's config is not a regular file.".to_string())
+        }
+        Ok(metadata) if metadata.len() > 8 * 1024 * 1024 => {
+            Err("CustomSkinLoader's config is larger than expected.".to_string())
+        }
+        Ok(_) => {
+            let bytes = fs::read(&config_path)
+                .map_err(|error| format!("Could not verify CustomSkinLoader's config: {error}"))?;
+            let config: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                format!("Could not verify CustomSkinLoader's config JSON: {error}")
+            })?;
+            let first_profile_ready = config
+                .get("loadlist")
+                .and_then(Value::as_array)
+                .and_then(|profiles| profiles.first())
+                .is_some_and(custom_skin_profile_matches_local_skin);
+            Ok(first_profile_ready || local_skin_extra_list_is_ready(&extra_list))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(local_skin_extra_list_is_ready(&extra_list))
+        }
+        Err(error) => Err(format!(
+            "Could not inspect CustomSkinLoader's config: {error}"
+        )),
+    }
+}
+
 #[tauri::command]
 fn get_custom_skin_support(
     app: AppHandle,
@@ -1371,7 +1557,7 @@ fn apply_custom_skin_to_profile(
         Err(error) => return Err(format!("Could not inspect the existing LocalSkin: {error}")),
     };
     let temporary = skin_directory.join(format!(".bee-skin-{timestamp}.tmp"));
-    fs::write(&temporary, skin_bytes)
+    fs::write(&temporary, &skin_bytes)
         .map_err(|error| format!("Could not prepare the local skin: {error}"))?;
     let settings_path = config_file(&app)?;
     let backup_directory = settings_path
@@ -1386,6 +1572,17 @@ fn apply_custom_skin_to_profile(
                 return Err(error);
             }
         };
+    let load_order_ready = match local_skin_priority_ready(&game_dir) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if !load_order_ready {
+        let _ = fs::remove_file(&temporary);
+        return Err("The LocalSkin profile could not be verified at the start of CustomSkinLoader's load order; the skin was not installed.".to_string());
+    }
     if backup.is_some() {
         fs::remove_file(&target)
             .map_err(|error| format!("Could not replace the existing LocalSkin: {error}"))?;
@@ -1397,12 +1594,138 @@ fn apply_custom_skin_to_profile(
         }
         return Err(format!("Could not install the local skin: {error}"));
     }
+    let staged_file_verified = fs::read(&target)
+        .map(|written| written == skin_bytes)
+        .unwrap_or(false);
+    if !staged_file_verified {
+        if let Some(backup_path) = backup.as_ref() {
+            let _ = fs::copy(backup_path, &target);
+        } else {
+            let _ = fs::remove_file(&target);
+        }
+        return Err("The staged skin could not be verified against the selected library image; the previous local file was restored if one existed.".to_string());
+    }
     Ok(SkinApplyResult {
         username,
         profile_id: version_id,
         replaced_existing: backup.is_some(),
         restart_required: loader_config.restart_required,
         config_backup_created: loader_config.backup_created,
+        skin_path: target.to_string_lossy().to_string(),
+        loader_config_path: game_dir
+            .join("CustomSkinLoader")
+            .join("CustomSkinLoader.json")
+            .to_string_lossy()
+            .to_string(),
+        staged_file_verified,
+        load_order_ready,
+    })
+}
+
+fn modified_epoch_millis(path: &Path) -> Option<u128> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
+fn local_skin_loader_fingerprint(path: &Path, relative_path: &str) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    // CustomSkinLoader 15.x hashes the decimal file size + configured relative path +
+    // Java File.lastModified() in milliseconds for its LOCAL_LEGACY texture URL.
+    let input = format!("{}{relative_path}{modified}", metadata.len());
+    Some(format!("{:x}", Sha1::digest(input.as_bytes())))
+}
+
+fn bounded_skin_log_tail(path: &Path, maximum: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(maximum)))
+        .ok()?;
+    let mut bytes = Vec::with_capacity(length.min(maximum) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn skin_loader_log_has_fingerprint(log: &str, fingerprint: &str, relative_path: &str) -> bool {
+    let expected = format!("(LOCAL_LEGACY){fingerprint},{relative_path}").to_ascii_lowercase();
+    log.to_ascii_lowercase().contains(&expected)
+}
+
+#[tauri::command]
+fn verify_custom_skin_application(
+    app: AppHandle,
+    profile_key: String,
+    username: String,
+    skin_id: String,
+) -> Result<SkinApplicationVerification, String> {
+    validate_username(&username)?;
+    let (game_dir, profile_id) = modpack::resolve_profile(&app, &profile_key)?;
+    let library = custom_skin_directory(&app)?;
+    let source = skin_file(&library, &skin_id)?;
+    let expected_skin = read_skin_png(&source)?;
+    let relative_path = format!("LocalSkin/skins/{username}.png");
+    let skin_path = game_dir
+        .join("CustomSkinLoader")
+        .join("LocalSkin")
+        .join("skins")
+        .join(format!("{username}.png"));
+    let skin_metadata = fs::symlink_metadata(&skin_path).ok();
+    let file_matches_library = skin_metadata.as_ref().is_some_and(|metadata| {
+        !metadata.file_type().is_symlink()
+            && metadata.is_file()
+            && metadata.len() <= 8 * 1024 * 1024
+            && fs::read(&skin_path).is_ok_and(|bytes| bytes == expected_skin)
+    });
+    let load_order_ready = local_skin_priority_ready(&game_dir)?;
+    let loader_log_path = game_dir
+        .join("CustomSkinLoader")
+        .join("CustomSkinLoader.log");
+    let log_metadata = fs::symlink_metadata(&loader_log_path).ok();
+    let loader_log_found = log_metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file());
+    let skin_modified = modified_epoch_millis(&skin_path);
+    let log_modified = modified_epoch_millis(&loader_log_path);
+    let loader_log_updated_after_skin = loader_log_found
+        && skin_modified
+            .zip(log_modified)
+            .is_some_and(|(skin, log)| log > skin);
+    let fingerprint = if file_matches_library {
+        local_skin_loader_fingerprint(&skin_path, &relative_path)
+    } else {
+        None
+    };
+    let matching_skin_fingerprint = loader_log_updated_after_skin
+        && fingerprint.as_deref().is_some_and(|fingerprint| {
+            bounded_skin_log_tail(&loader_log_path, 128 * 1024).is_some_and(|log| {
+                skin_loader_log_has_fingerprint(&log, fingerprint, &relative_path)
+            })
+        });
+    let load_confirmed = file_matches_library
+        && load_order_ready
+        && loader_log_updated_after_skin
+        && matching_skin_fingerprint;
+    Ok(SkinApplicationVerification {
+        username,
+        profile_id,
+        skin_path: skin_path.to_string_lossy().to_string(),
+        loader_log_path: loader_log_path.to_string_lossy().to_string(),
+        file_matches_library,
+        load_order_ready,
+        loader_log_found,
+        loader_log_updated_after_skin,
+        matching_skin_fingerprint,
+        load_confirmed,
     })
 }
 
@@ -2502,10 +2825,68 @@ fn write_launch_diagnostics(
     log.flush()
 }
 
+fn apply_intel_uhd_low_graphics(game_dir: &Path) -> Result<(), String> {
+    let options_path = game_dir.join("options.txt");
+    let previous = fs::read_to_string(&options_path).unwrap_or_default();
+    let overrides = [
+        ("graphicsMode", "0"),
+        ("renderDistance", "6"),
+        ("simulationDistance", "4"),
+        ("maxFps", "60"),
+        ("clouds", "0"),
+        ("particles", "1"),
+        ("mipmapLevels", "0"),
+        ("entityDistanceScaling", "0.5"),
+        ("biomeBlendRadius", "0"),
+        ("entityShadows", "false"),
+        ("ao", "0"),
+    ];
+    let mut seen = HashSet::new();
+    let mut lines = previous
+        .lines()
+        .map(|line| {
+            if let Some((key, _)) = line.split_once(':') {
+                if let Some((_, value)) = overrides
+                    .iter()
+                    .find(|(override_key, _)| *override_key == key)
+                {
+                    seen.insert(key.to_string());
+                    return format!("{key}:{value}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>();
+    for (key, value) in overrides {
+        if !seen.contains(key) {
+            lines.push(format!("{key}:{value}"));
+        }
+    }
+    fs::write(&options_path, format!("{}\n", lines.join("\n")))
+        .map_err(|error| format!("Could not apply the Intel UHD low-graphics preset: {error}"))
+}
+
+fn restore_graphics_baseline(game_dir: &Path, original: Option<&str>) -> Result<(), String> {
+    let options_path = game_dir.join("options.txt");
+    match original {
+        Some(contents) => fs::write(&options_path, contents).map_err(|error| {
+            format!("Could not restore the previous Minecraft graphics options: {error}")
+        }),
+        None => match fs::remove_file(&options_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Could not restore the previous Minecraft graphics options: {error}"
+            )),
+        },
+    }
+}
+
 fn launch_game(
     app: &AppHandle,
     game_dir: &Path,
     version_id: &str,
+    profile_key: &str,
     username: &str,
 ) -> Result<LaunchResult, String> {
     ensure_version_id(version_id)?;
@@ -2517,12 +2898,34 @@ fn launch_game(
         .map(|(_, metadata)| metadata)
         .unwrap_or(&chain[0].1);
     let required_major = required_java_major(java_profile);
-    let java_runtime = find_java_for_profile(game_dir, java_profile).ok_or_else(|| {
-        required_major.map_or_else(
-            || "A usable Java runtime was not found for this profile.".to_string(),
-            |major| format!("This profile requires Java {major}; no compatible runtime was found."),
-        )
-    })?;
+    let mut launch_settings = read_stored_settings(app);
+    let profile_settings = launch_settings
+        .profile_settings
+        .get(profile_key)
+        .cloned()
+        .unwrap_or_default();
+    let java_runtime = if let Some(path) = profile_settings.java_path.as_deref() {
+        let java = PathBuf::from(path);
+        if !java.is_file() {
+            return Err("The selected profile's Java runtime is missing. Choose another runtime in Settings or switch it back to automatic detection.".to_string());
+        }
+        let actual_major = java_major_version(&java_probe_path(&java)).ok_or_else(|| {
+            "Bee Launcher could not read the selected profile's Java runtime.".to_string()
+        })?;
+        if required_major.is_some_and(|required| required != actual_major) {
+            return Err(format!("This profile requires Java {}, but its saved runtime is Java {actual_major}. Update the Java selection in Settings.", required_major.unwrap()));
+        }
+        java
+    } else {
+        find_java_for_profile(game_dir, java_profile).ok_or_else(|| {
+            required_major.map_or_else(
+                || "A usable Java runtime was not found for this profile.".to_string(),
+                |major| {
+                    format!("This profile requires Java {major}; no compatible runtime was found.")
+                },
+            )
+        })?
+    };
     let java = java_for_game_launch(&java_runtime);
     let http = downloader()?;
     ensure_client_jar(&http, game_dir, &chain)?;
@@ -2531,7 +2934,26 @@ fn launch_game(
     if let Some(spec) = jopt_simple_spec(&chain) {
         ensure_downloaded(&http, game_dir, &spec, "jopt-simple support library")?;
     }
-    let launch_settings = read_stored_settings(app);
+    let graphics_restore_key = game_dir.to_string_lossy().into_owned();
+    if profile_settings.graphics_preset == "intel-uhd-low" {
+        if !launch_settings
+            .graphics_restore_points
+            .contains_key(&graphics_restore_key)
+        {
+            let original = fs::read_to_string(game_dir.join("options.txt")).ok();
+            launch_settings
+                .graphics_restore_points
+                .insert(graphics_restore_key.clone(), original);
+            write_stored_settings(app, &launch_settings)?;
+        }
+        apply_intel_uhd_low_graphics(game_dir)?;
+    } else if let Some(original) = launch_settings
+        .graphics_restore_points
+        .remove(&graphics_restore_key)
+    {
+        restore_graphics_baseline(game_dir, original.as_deref())?;
+        write_stored_settings(app, &launch_settings)?;
+    }
     let client_jar = resolve_client_jar(game_dir, version_id, &chain)?;
     let (library_classpath, native_dir) =
         classpath_and_extract_natives(game_dir, version_id, &chain)?;
@@ -2645,7 +3067,10 @@ fn launch_game(
         jvm_args.push(classpath.clone());
     }
     jvm_args.retain(|arg| !arg.starts_with("-Xmx"));
-    jvm_args.push(format!("-Xmx{}G", launch_settings.max_memory_gb));
+    let memory_gb = profile_settings
+        .max_memory_gb
+        .unwrap_or(launch_settings.max_memory_gb);
+    jvm_args.push(format!("-Xmx{memory_gb}G"));
     let main_class = first_field(&chain, "mainClass")
         .and_then(Value::as_str)
         .ok_or_else(|| "The selected profile is missing its Java main class.".to_string())?;
@@ -2740,7 +3165,7 @@ fn launch_version(
     username: String,
 ) -> Result<LaunchResult, String> {
     let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
-    launch_game(&app, &game_dir, &version_id, &username)
+    launch_game(&app, &game_dir, &version_id, &profile_key, &username)
 }
 
 #[tauri::command]
@@ -2764,9 +3189,258 @@ fn open_game_directory(app: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("Could not open {}: {error}", game_dir.display()))
 }
 
+fn decode_article_text(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&#38;", "&")
+}
+
+fn plain_article_text(markup: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for character in markup.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !output.ends_with(' ') {
+                    output.push(' ');
+                }
+            }
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    decode_article_text(&output.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!(" {name}={quote}");
+        if let Some(start) = tag.find(&needle).map(|index| index + needle.len()) {
+            let end = tag[start..].find(quote)? + start;
+            return Some(decode_article_text(&tag[start..end]));
+        }
+    }
+    None
+}
+
+fn article_tag_content(segment: &str, tag: &str) -> Option<String> {
+    let start = segment.find(&format!("<{tag}"))?;
+    let content_start = segment[start..].find('>')? + start + 1;
+    let end = segment[content_start..].find(&format!("</{tag}>"))? + content_start;
+    Some(plain_article_text(&segment[content_start..end]))
+}
+
+fn official_article_url(href: &str) -> Option<String> {
+    if href.starts_with("/") && !href.starts_with("//") {
+        Some(format!("https://www.minecraft.net{href}"))
+    } else if href.starts_with("https://www.minecraft.net/")
+        || href.starts_with("https://minecraft.net/")
+    {
+        Some(href.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_minecraft_article_cards(html: &str) -> Vec<MinecraftNewsArticle> {
+    let marker = "MC_tiledHeroA_card";
+    let mut position = 0;
+    let mut articles = Vec::new();
+    while let Some(found) = html[position..].find(marker) {
+        let card_start = position + found;
+        let card_end = html[card_start + marker.len()..]
+            .find(marker)
+            .map(|next| card_start + marker.len() + next)
+            .unwrap_or(html.len());
+        let segment = &html[card_start..card_end];
+        position = card_start + marker.len();
+        let Some(title) = article_tag_content(segment, "h2") else {
+            continue;
+        };
+        let summary = article_tag_content(segment, "p").unwrap_or_default();
+        let mut link_search = segment;
+        let mut url = None;
+        while let Some(anchor) = link_search.find("<a") {
+            let after = &link_search[anchor..];
+            let Some(tag_end) = after.find('>') else {
+                break;
+            };
+            let tag = &after[..=tag_end];
+            if let Some(href) =
+                html_attribute(tag, "href").and_then(|href| official_article_url(&href))
+            {
+                url = Some(href);
+                break;
+            }
+            link_search = &after[tag_end + 1..];
+        }
+        if let Some(url) = url {
+            if !articles
+                .iter()
+                .any(|article: &MinecraftNewsArticle| article.url == url)
+            {
+                articles.push(MinecraftNewsArticle {
+                    title,
+                    summary,
+                    url,
+                });
+            }
+        }
+        if articles.len() >= 10 {
+            break;
+        }
+    }
+    articles
+}
+
+#[tauri::command]
+fn fetch_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(format!("BeeLauncher/{LAUNCHER_VERSION}"))
+        .build()
+        .map_err(|error| format!("Could not prepare the news request: {error}"))?;
+    let response = client
+        .get("https://www.minecraft.net/en-us/article")
+        .send()
+        .map_err(|error| format!("Could not reach the official Minecraft News page: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The official Minecraft News page returned HTTP {}.",
+            response.status()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > 5 * 1024 * 1024)
+    {
+        return Err("The official news page was larger than expected.".to_string());
+    }
+    let html = response
+        .text()
+        .map_err(|error| format!("Could not read the official Minecraft News page: {error}"))?;
+    if html.len() > 5 * 1024 * 1024 {
+        return Err("The official news page was larger than expected.".to_string());
+    }
+    let articles = parse_minecraft_article_cards(&html);
+    if articles.is_empty() {
+        return Err("The official news page format changed; open Minecraft.net to view the latest announcements.".to_string());
+    }
+    Ok(articles)
+}
+
+#[tauri::command]
+fn open_minecraft_news_link(url: String) -> Result<(), String> {
+    if official_article_url(&url).as_deref() != Some(url.as_str()) {
+        return Err(
+            "Only links from the official Minecraft website can be opened here.".to_string(),
+        );
+    }
+    #[cfg(windows)]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open the official Minecraft article: {error}"))
+}
+
+fn world_backup_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    config_file(app)?
+        .parent()
+        .map(|parent| parent.join("world-backups"))
+        .ok_or_else(|| "Could not find the Bee Launcher data folder.".to_string())
+}
+
+fn world_backup_source(
+    app: &AppHandle,
+    profile_key: Option<&str>,
+) -> Result<(PathBuf, String), String> {
+    if let Some(key) = profile_key.filter(|key| !key.trim().is_empty()) {
+        let (game_dir, _) = modpack::resolve_profile(app, key)?;
+        return Ok((game_dir, key.to_string()));
+    }
+    Ok((
+        resolve_game_dir(app)?,
+        "Default Minecraft folder".to_string(),
+    ))
+}
+
+#[tauri::command]
+fn list_world_backups(app: AppHandle) -> Result<Vec<world_backup::BackupSummary>, String> {
+    world_backup::list_backups(&world_backup_directory(&app)?)
+}
+
+#[tauri::command]
+fn create_world_backup(
+    app: AppHandle,
+    profile_key: Option<String>,
+) -> Result<world_backup::BackupSummary, String> {
+    let (game_dir, label) = world_backup_source(&app, profile_key.as_deref())?;
+    world_backup::create_backup(
+        &world_backup_directory(&app)?,
+        &game_dir.join("saves"),
+        &label,
+    )
+}
+
+#[tauri::command]
+fn inspect_world_backup(
+    app: AppHandle,
+    backup_id: String,
+    profile_key: Option<String>,
+) -> Result<world_backup::RestorePreview, String> {
+    let (game_dir, _) = world_backup_source(&app, profile_key.as_deref())?;
+    world_backup::inspect_backup(
+        &world_backup_directory(&app)?,
+        &backup_id,
+        &game_dir.join("saves"),
+    )
+}
+
+#[tauri::command]
+fn restore_world_backup(
+    app: AppHandle,
+    backup_id: String,
+    profile_key: Option<String>,
+    selected_worlds: Vec<String>,
+) -> Result<world_backup::RestoreResult, String> {
+    let (game_dir, _) = world_backup_source(&app, profile_key.as_deref())?;
+    world_backup::restore_backup(
+        &world_backup_directory(&app)?,
+        &backup_id,
+        &game_dir.join("saves"),
+        &selected_worlds,
+    )
+}
+
+#[tauri::command]
+fn diagnose_launch_log(
+    app: AppHandle,
+    profile_key: String,
+) -> Result<crash_helper::CrashDiagnosis, String> {
+    let (game_dir, _) = modpack::resolve_profile(&app, &profile_key)?;
+    Ok(crash_helper::analyze_log(
+        &game_dir.join("logs").join("blockline-latest.log"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn seed_profile_libraries_for_host(game_dir: &Path, chain: &[(String, Value)]) {
@@ -3195,8 +3869,9 @@ mod tests {
 mod custom_skin_tests {
     use super::{
         ensure_custom_skin_loader_local_skin_first, installed_custom_skin_loader_version,
-        parse_custom_skin_loader_version, prioritize_local_skin_profile, read_skin_png,
-        safe_skin_id,
+        local_skin_loader_fingerprint, local_skin_priority_ready, parse_custom_skin_loader_version,
+        prioritize_local_skin_profile, read_skin_png, safe_skin_id,
+        skin_loader_log_has_fingerprint,
     };
     use std::{
         fs,
@@ -3310,6 +3985,28 @@ mod custom_skin_tests {
     }
 
     #[test]
+    fn local_skin_log_fingerprint_matches_the_current_local_file_reference() {
+        let root = test_skin_path("skin-log-fingerprint").with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("Player.png");
+        fs::write(&path, b"verified skin bytes").unwrap();
+        let relative = "LocalSkin/skins/Player.png";
+        let fingerprint = local_skin_loader_fingerprint(&path, relative).unwrap();
+        let log = format!("Player's profile loaded. (SkinUrl: (LOCAL_LEGACY){fingerprint},{relative} , Model: auto)\n");
+        assert!(skin_loader_log_has_fingerprint(
+            &log,
+            &fingerprint,
+            relative
+        ));
+        assert!(!skin_loader_log_has_fingerprint(
+            &log,
+            "0000000000000000000000000000000000000000",
+            relative
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn config_repair_backs_up_the_original_and_moves_localskin_first() {
         let root = test_skin_path("config-backup").with_extension("");
         let game_dir = root.join("game");
@@ -3335,6 +4032,7 @@ mod custom_skin_tests {
         assert_eq!(config["loadlist"][0]["name"], "LocalSkin");
         assert_eq!(config["loadlist"][1]["name"], "Mojang");
         assert_eq!(config["threadPoolSize"], 4);
+        assert!(local_skin_priority_ready(&game_dir).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3361,6 +4059,7 @@ mod custom_skin_tests {
         assert_eq!(profile["name"], "BeeLauncherLocalSkin");
         assert_eq!(profile["type"], "Legacy");
         assert_eq!(profile["skin"], "LocalSkin/skins/{USERNAME}.png");
+        assert!(local_skin_priority_ready(&game_dir).unwrap());
         let repeated = ensure_custom_skin_loader_local_skin_first(&game_dir, &backup_dir).unwrap();
         assert!(repeated.restart_required);
         assert_eq!(fs::read_dir(extra_dir).unwrap().count(), 1);
@@ -3476,6 +4175,7 @@ pub fn run() {
             app_status,
             get_launcher_settings,
             save_launcher_settings,
+            save_profile_launch_settings,
             set_game_directory,
             set_wallpaper,
             get_wallpaper_data,
@@ -3486,9 +4186,17 @@ pub fn run() {
             remove_custom_skin,
             get_custom_skin_support,
             apply_custom_skin_to_profile,
+            verify_custom_skin_application,
             reset_wallpaper,
             import_modpack,
             launch_version,
+            fetch_minecraft_news,
+            open_minecraft_news_link,
+            list_world_backups,
+            create_world_backup,
+            inspect_world_backup,
+            restore_world_backup,
+            diagnose_launch_log,
             open_game_directory
         ])
         .run(tauri::generate_context!())

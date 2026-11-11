@@ -15,10 +15,11 @@
         <img class="art" id="a2" alt="" />
         <div class="logo" id="logo"><img class="logo-mark" id="minecraft-logo" alt="Minecraft" /></div>
       </div>
-      <aside class="skin-showcase" id="skin-showcase" aria-label="3D Minecraft character skin preview">
+      <aside class="skin-showcase loading" id="skin-showcase" aria-label="3D Minecraft character skin preview">
         <canvas class="skin-canvas" id="skin-canvas"></canvas>
         <div class="skin-preview-fallback" id="skin-preview-fallback" hidden><span class="skin-fallback-face"></span><small>3D preview needs WebGL</small></div>
-        <div class="skin-preview-caption"><b id="skin-preview-name">Default skin</b><small>Move pointer to look · Drag to turn</small></div>
+        <div class="skin-preview-caption"><b id="skin-preview-name">Loading saved skin…</b><small>Move pointer to look · Drag to turn</small></div>
+        <div class="skin-preview-loading" aria-live="polite"><span></span><b>Loading active skin</b></div>
       </aside>
       <div class="fade" aria-hidden="true"></div>
       <div class="window-drag" id="window-drag" aria-label="Drag to move the launcher"></div>
@@ -72,19 +73,11 @@
         <button data-s="skins">Skins</button>
         <button data-s="mods">Mods</button>
         <button data-s="servers">Servers</button>
-          <button data-s="notes">Patch notes</button>
-        <button class="news" id="news-button" aria-expanded="false">News<span id="chev">▴</span></button>
+        <button data-s="notes">Patch notes</button>
+        <button class="news" id="news-button" data-s="news">News</button>
       </nav>
 
       <div class="toast" id="toast" role="status" aria-live="polite"></div>
-      <aside class="drawer" id="drawer" aria-label="Local launcher information">
-        <div class="dh"><h2>Local launcher</h2><button id="news-close" aria-label="Close information">✕</button></div>
-        <div class="cards">
-          <article class="card"><i style="background:linear-gradient(135deg,#6b4a2f,#b8945f)"></i><div><b>Profiles from this PC</b><small>Bee Launcher scans the selected .minecraft folder and launches installed vanilla or Fabric profiles from disk.</small></div></article>
-          <article class="card"><i style="background:linear-gradient(135deg,#243a9a,#5a7fe0)"></i><div><b>Missing files</b><small>When a profile declares a download URL, the launcher checks the file size and SHA-1 before using it.</small></div></article>
-          <article class="card"><i style="background:linear-gradient(135deg,#f08ac0,#ffb457)"></i><div><b>Offline account mode</b><small>This build does not use Microsoft or TLauncher sign-in tokens. Online servers that require authentication are not supported.</small></div></article>
-        </div>
-      </aside>
       <span id="status-text" class="sr-only" aria-live="polite">Searching for Minecraft profiles</span>
     </div>
     <script type="module" src="/src/main.js"></script>

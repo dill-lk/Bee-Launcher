@@ -53,11 +53,37 @@ const accentColors = {
   red: ['#d93a3a', '#ff8a8a', '#701818', '#ee4a4a'],
 };
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
+const beeReleaseNotes = [
+  {
+    version: '0.1.24', date: '2026-11-11', title: 'Performance, safety, and news',
+    changes: [
+      'Redesigned Settings and added per-profile Java, memory, and graphics choices.',
+      'Added an optional Intel UHD low-impact preset; it is off by default and restores the saved game graphics options when switched back to default.',
+      'Added local world backups with a restore preview, explicit confirmation, and a safety copy before replacing same-named worlds.',
+      'Added plain-English explanations for the most recent local launch log.',
+      'Preloads the saved active skin before the 3D character is shown; skin application now distinguishes staging from a confirmed in-game load.',
+      'Added on-demand official Minecraft News and a Bee Launcher release-notes page.',
+    ],
+  },
+  {
+    version: '0.1.23', date: 'Previous release', title: 'Custom skins and profile preview',
+    changes: [
+      'Added a saved skin library and interactive 3D character preview.',
+      'Added local custom-skin staging for supported Fabric profiles with CustomSkinLoader.',
+      'Added launcher appearance settings and isolated modpack profiles.',
+    ],
+  },
+];
 const avatarStorageKey = 'blockline.playerAvatar';
 let appearance = loadAppearance();
 let appStatus = { gameDirectory: '', installedVersions: [], javaAvailable: false };
 let settings = { maxMemoryGb: 4, width: 1280, height: 720, fullscreen: false, wallpaperPath: null, wallpaperName: null };
+let profileLaunchSettings = {};
+let profileLaunchDrafts = {};
+let profileLaunchSelectedKey = '';
+let worldRestoreReview = null;
 let customSkins = [];
+let lastAppliedSkin = null;
 let activeSkinId = null;
 let customSkinSupport = { supported: false, reason: 'Select a Fabric 26.3 profile to check CustomSkinLoader.', loaderVersion: null, checked: false };
 let toastTimer;
@@ -389,6 +415,8 @@ async function refreshStatus(showMessage = false) {
     appStatus = await invoke('app_status');
     renderStatus();
     if (activePanel === 'skins') refreshCustomSkinSupport();
+    if (activePanel === 'settings') renderProfileLaunchControls();
+    if (activePanel === 'mods') renderWorldBackupPanel();
     if (showMessage) {
       const ready = appStatus.installedVersions.filter((version) => version.launchable).length;
       notify(`${appStatus.installedVersions.length} profile${appStatus.installedVersions.length === 1 ? '' : 's'} detected · ${ready} ready to launch.`);
@@ -399,6 +427,7 @@ async function refreshStatus(showMessage = false) {
 }
 
 function reflectSettings(prefs) {
+  if (prefs.profileSettings) profileLaunchSettings = structuredClone(prefs.profileSettings);
   settings = { ...settings, ...prefs };
   updateSettingsPath();
   const memory = $('#memory-range');
@@ -418,6 +447,90 @@ function reflectSettings(prefs) {
   const wallpaperName = $('#wallpaper-name');
   if (wallpaperName) wallpaperName.textContent = settings.wallpaperName || (settings.wallpaperPath ? settings.wallpaperPath.split(/[\\/]/).pop() : 'Built-in design wallpaper');
   updateWallpaperSelection();
+}
+
+function renderProfileLaunchControls() {
+  const select = $('#profile-launch-select');
+  if (!select) return;
+  const versions = appStatus.installedVersions || [];
+  if (!versions.length) {
+    select.innerHTML = '<option value="">No installed profiles detected</option>';
+    select.disabled = true;
+    ['#profile-memory', '#profile-graphics', '#profile-java-choose', '#profile-java-reset'].forEach((selector) => { const control = $(selector); if (control) control.disabled = true; });
+    $('#profile-java-value').textContent = 'Choose a Minecraft profile first';
+    $('#profile-preset-note').textContent = 'Scan your Minecraft folder to configure profile-specific performance.';
+    return;
+  }
+  select.disabled = false;
+  ['#profile-memory', '#profile-graphics', '#profile-java-choose', '#profile-java-reset'].forEach((selector) => { const control = $(selector); if (control) control.disabled = false; });
+  select.innerHTML = versions.map((version) => {
+    const key = profileKeyOf(version);
+    const label = version.instanceName ? `${version.instanceName} · ${version.id}` : version.id;
+    return `<option value="${escapeHtml(key)}">${escapeHtml(label)} · ${escapeHtml(version.kind)}</option>`;
+  }).join('');
+  if (!versions.some((version) => profileKeyOf(version) === profileLaunchSelectedKey)) {
+    profileLaunchSelectedKey = versions.some((version) => profileKeyOf(version) === selectedVersion)
+      ? selectedVersion
+      : profileKeyOf(versions[0]);
+  }
+  select.value = profileLaunchSelectedKey;
+  const profile = versions.find((version) => profileKeyOf(version) === profileLaunchSelectedKey);
+  const prefs = profileLaunchDrafts[profileLaunchSelectedKey] || profileLaunchSettings[profileLaunchSelectedKey] || {};
+  $('#profile-memory').value = prefs.maxMemoryGb ?? '';
+  $('#profile-graphics').value = prefs.graphicsPreset || 'default';
+  const javaValue = $('#profile-java-value');
+  if (prefs.javaPath) {
+    javaValue.textContent = prefs.javaPath;
+    javaValue.title = prefs.javaPath;
+    $('#profile-java-hint').textContent = 'Custom runtime · checked against this profile before launch.';
+  } else {
+    javaValue.textContent = 'Automatic detection';
+    javaValue.title = 'Uses a compatible Java runtime already installed on this PC.';
+    $('#profile-java-hint').textContent = profile?.requiredJavaMajor ? `Automatically picks Java ${profile.requiredJavaMajor} for this profile.` : 'Automatically picks a compatible Java runtime.';
+  }
+  $('#profile-preset-note').textContent = `${profile?.kind || 'Profile'} · ${profile?.requiredJavaMajor ? `requires Java ${profile.requiredJavaMajor}` : 'Java version detected automatically'} · ${prefs.maxMemoryGb ? `${prefs.maxMemoryGb} GB override` : `uses ${settings.maxMemoryGb || 4} GB default memory`}.`;
+}
+
+function updateProfileLaunchDraft(field, value) {
+  if (!profileLaunchSelectedKey) return;
+  const current = profileLaunchDrafts[profileLaunchSelectedKey] || profileLaunchSettings[profileLaunchSelectedKey] || {};
+  profileLaunchDrafts[profileLaunchSelectedKey] = {
+    javaPath: current.javaPath ?? null,
+    maxMemoryGb: current.maxMemoryGb ?? null,
+    graphicsPreset: current.graphicsPreset || 'default',
+    [field]: value,
+  };
+  renderProfileLaunchControls();
+}
+
+async function pickProfileJava() {
+  try {
+    const selected = await open({ directory: false, multiple: false, title: 'Choose a Java executable for this profile', filters: [{ name: 'Java executable', extensions: ['exe'] }] });
+    if (selected) updateProfileLaunchDraft('javaPath', selected);
+  } catch (error) {
+    notify(`Could not select that Java runtime: ${error}`, 7000);
+  }
+}
+
+async function explainLastLaunch() {
+  const key = $('#profile-launch-select')?.value || selectedVersion;
+  const output = $('#crash-diagnosis');
+  const button = $('#diagnose-last-launch');
+  if (!key || !output || !button) {
+    notify('Select an installed profile first.');
+    return;
+  }
+  output.hidden = false;
+  output.textContent = 'Reading the selected profile’s local launch log…';
+  button.disabled = true;
+  try {
+    const diagnosis = await invoke('diagnose_launch_log', { profileKey: key });
+    output.innerHTML = `<div class="crash-diagnosis-heading"><b>${escapeHtml(diagnosis.title)}</b><p>${escapeHtml(diagnosis.summary)}</p></div><div class="crash-diagnosis-columns"><div><b>Possible causes</b><ul>${diagnosis.likelyCauses.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></div><div><b>Try this</b><ul>${diagnosis.nextSteps.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></div></div>${diagnosis.logExcerpt ? `<details><summary>Redacted log excerpt</summary><pre>${escapeHtml(diagnosis.logExcerpt)}</pre></details>` : ''}`;
+  } catch (error) {
+    output.textContent = `Could not analyze this profile's log: ${error}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function swapWallpaper(src, showLogo = false, position = '50% 50%') {
@@ -488,14 +601,18 @@ function openPanel(name, title = '') {
   updateNav(name === 'settings' ? 'play' : name);
   if (name === 'play') return;
   sheet.classList.add('on');
-  sheet.classList.toggle('big', name === 'settings' || name === 'inst' || name === 'mods' || name === 'skins');
+  sheet.classList.toggle('big', name === 'settings' || name === 'inst' || name === 'mods' || name === 'skins' || name === 'news' || name === 'notes');
+  sheet.classList.toggle('news-panel', name === 'news' || name === 'notes');
   sheet.classList.toggle('skin-panel', name === 'skins');
   if (name === 'settings') {
     sheet.classList.add('settings-panel');
+    profileLaunchDrafts = structuredClone(profileLaunchSettings);
+    profileLaunchSelectedKey = selectedVersion;
     sheet.innerHTML = settingsMarkup();
     renderAvatar();
     bindSettings();
     reflectSettings(settings);
+    renderProfileLaunchControls();
   } else if (name === 'inst') {
     sheet.innerHTML = `${panelHeader('Installations', 'Local Minecraft profiles and imported packs')}<div class="profile-list" id="installations-list"></div><div class="panel-actions"><button class="btn" id="rescan-button">Rescan</button><button class="btn" id="choose-folder-modal">Choose folder</button><button class="btn pri" id="import-modpack-from-inst">Import Modpack</button></div>`;
     renderInstallations();
@@ -508,15 +625,25 @@ function openPanel(name, title = '') {
         <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">ZIPs reuse installed Minecraft files; .mrpacks may download missing files.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>`;
+      <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>
+      <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);
     renderImportedPacks();
+    $('#create-world-backup').addEventListener('click', createWorldBackup);
+    renderWorldBackupPanel();
+  } else if (name === 'news') {
+    sheet.innerHTML = `${panelHeader('Minecraft News', 'Official announcements from Minecraft.net')}<div class="news-page-toolbar"><p>News loads only when you open this page or choose Refresh.</p><button class="btn" id="refresh-minecraft-news">Refresh news</button></div><div class="minecraft-news-status" id="minecraft-news-status" role="status">Loading official news…</div><div class="minecraft-news-grid" id="minecraft-news-grid"></div>`;
+    $('#refresh-minecraft-news').addEventListener('click', loadMinecraftNews);
+    loadMinecraftNews();
+  } else if (name === 'notes') {
+    sheet.innerHTML = `${panelHeader('Patch Notes', 'Bee Launcher releases')}<div class="patch-notes-intro"><b>Local release history</b><p>These notes describe changes to Bee Launcher. Minecraft game snapshots and release notes are published on the official News page.</p></div><div class="patch-notes-list">${renderPatchNotes()}</div>`;
   } else if (name === 'skins') {
     sheet.innerHTML = `${panelHeader('Custom skins', 'Local skins for your Bee profile')}
       <div class="skin-heading"><div class="section-intro"><h3>Your skin library</h3><p>Add a Minecraft skin PNG for the launcher avatar, or apply it in-game when CustomSkinLoader is installed.</p></div><button class="btn pri" id="skin-add">Add skin PNG</button></div>
       <div class="skin-support" id="skin-support-status" role="status" aria-live="polite"></div>
       <div class="custom-skin-grid" id="custom-skin-grid"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's LocalSkin folder and work only on this client; other players will not see them. On first apply, Bee moves LocalSkin ahead of online skin sources because CustomSkinLoader's default order can ignore the local file. Existing CustomSkinLoader settings are backed up in Bee Launcher app data before that change; if the mod has not created its config yet, Bee stages a one-use ExtraList entry. Fully quit and restart Minecraft once so the mod reads the corrected order. Bee does not sign in, upload skins, install/update mods, or change worlds, profile JSON, or authentication. Same-name LocalSkin images are backed up before replacement, and removing a library skin does not delete an already-applied file.</span></div>`;
+      <section class="skin-application-card" id="skin-application-card" hidden></section>
+      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's LocalSkin folder and work only on this client; other players will not see them. On first apply, Bee moves LocalSkin ahead of online skin sources because the default order can ignore the local file. Existing config is backed up before changes; if it does not exist yet, Bee stages a one-use ExtraList entry. Bee checks the copied PNG and source order, but the loader log is checked separately after you fully restart Minecraft and open a world. Bee does not sign in, upload skins, install/update mods, or change worlds, profile JSON, or authentication. Same-name LocalSkin images are backed up before replacement; removing a library skin does not delete an already-applied file.</span></div>`;
     renderCustomSkins();
     refreshCustomSkinSupport();
     $('#skin-add').addEventListener('click', addCustomSkin);
@@ -524,7 +651,6 @@ function openPanel(name, title = '') {
     const messages = {
       realms: 'Realms is not available in this local launcher. It only starts profiles already installed on this device.',
       servers: 'This local launcher does not browse or join servers. Online play requiring Microsoft or TLauncher authentication is unsupported.',
-      notes: 'This local build does not load or invent Minecraft patch notes. Use the Minecraft website or official launcher for current release notes.',
     };
     sheet.innerHTML = `${panelHeader(title || 'Unavailable')}<div class="item"><span class="dot" style="background:#ffcf4a"></span><div><b>Not part of this local build</b><small>${escapeHtml(messages[name] || 'This feature is not available in this local launcher.')}</small></div></div>`;
   }
@@ -532,55 +658,217 @@ function openPanel(name, title = '') {
   if (close) close.addEventListener('click', () => openPanel('play'));
 }
 
+function renderPatchNotes() {
+  return beeReleaseNotes.map((release, index) => `<article class="patch-note-card"><div class="patch-note-meta"><span>Bee Launcher</span><b>v${escapeHtml(release.version)}</b><time>${escapeHtml(release.date)}</time></div><h3>${escapeHtml(release.title)}</h3><ul>${release.changes.map((change) => `<li>${escapeHtml(change)}</li>`).join('')}</ul>${index === 0 ? '<span class="patch-note-current">CURRENT RELEASE</span>' : ''}</article>`).join('');
+}
+
+async function loadMinecraftNews() {
+  const status = $('#minecraft-news-status');
+  const grid = $('#minecraft-news-grid');
+  const button = $('#refresh-minecraft-news');
+  if (!status || !grid || !button) return;
+  button.disabled = true;
+  button.textContent = 'Refreshing…';
+  status.textContent = 'Fetching announcements from the official Minecraft website…';
+  grid.innerHTML = '';
+  try {
+    const articles = await invoke('fetch_minecraft_news');
+    grid.innerHTML = articles.map((article) => `<article class="minecraft-news-card"><span class="news-card-source">MINECRAFT.NET · OFFICIAL</span><h3>${escapeHtml(article.title)}</h3><p>${escapeHtml(article.summary || 'Read the latest announcement from Mojang.')}</p><button class="btn news-read-link" data-news-url="${escapeHtml(article.url)}">Read article</button></article>`).join('');
+    status.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. News is fetched only when requested.`;
+    grid.querySelectorAll('[data-news-url]').forEach((link) => link.addEventListener('click', async () => {
+      try { await invoke('open_minecraft_news_link', { url: link.dataset.newsUrl }); }
+      catch (error) { notify(`Could not open the official article: ${error}`, 7000); }
+    }));
+  } catch (error) {
+    status.textContent = `Could not refresh official news: ${error}`;
+    grid.innerHTML = '<article class="minecraft-news-card news-fallback"><span class="news-card-source">OFFICIAL SOURCE</span><h3>Visit Minecraft.net</h3><p>Open the official News page in your browser to see the latest announcements.</p><button class="btn" id="open-minecraft-news-page">Open Minecraft News</button></article>';
+    $('#open-minecraft-news-page').addEventListener('click', async () => {
+      try { await invoke('open_minecraft_news_link', { url: 'https://www.minecraft.net/en-us/article' }); }
+      catch (openError) { notify(`Could not open Minecraft.net: ${openError}`, 7000); }
+    });
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Refresh news';
+  }
+}
+
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 1) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+  return `${amount.toFixed(unit === 0 || amount >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+async function renderWorldBackupPanel() {
+  const select = $('#world-backup-profile');
+  const list = $('#world-backup-list');
+  if (!select || !list) return;
+  const selected = select.value || selectedVersion;
+  const profiles = appStatus.installedVersions || [];
+  select.innerHTML = '<option value="">Default Minecraft folder</option>' + profiles.map((profile) => {
+    const key = profileKeyOf(profile);
+    const label = profile.instanceName ? `${profile.instanceName} · ${profile.id}` : profile.id;
+    return `<option value="${escapeHtml(key)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  select.value = profiles.some((profile) => profileKeyOf(profile) === selected) ? selected : '';
+  try {
+    const backups = await invoke('list_world_backups');
+    if (!backups.length) {
+      list.innerHTML = '<div class="world-backup-empty">No backups yet. Create one to safely preserve the selected saves folder.</div>';
+      return;
+    }
+    list.innerHTML = backups.map((backup) => `<article class="world-backup-item"><div class="world-backup-item-main"><b>${backup.worldCount} world${backup.worldCount === 1 ? '' : 's'} · ${formatFileSize(backup.totalBytes)}</b><small>${escapeHtml(new Date(backup.createdAt * 1000).toLocaleString())}</small><span>${escapeHtml(backup.worldNames.join(' · '))}</span></div><button class="btn" data-review-backup="${escapeHtml(backup.id)}">Review restore</button></article>`).join('');
+    list.querySelectorAll('[data-review-backup]').forEach((button) => button.addEventListener('click', () => openWorldRestoreReview(button.dataset.reviewBackup)));
+  } catch (error) {
+    list.innerHTML = `<div class="world-backup-empty error">Could not read local backups: ${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function createWorldBackup() {
+  const button = $('#create-world-backup');
+  const status = $('#world-backup-status');
+  if (!button || !status) return;
+  button.disabled = true;
+  status.textContent = 'Creating a local backup…';
+  try {
+    const summary = await invoke('create_world_backup', { profileKey: $('#world-backup-profile').value || null });
+    status.textContent = `Backup created: ${summary.worldCount} world${summary.worldCount === 1 ? '' : 's'} · ${formatFileSize(summary.totalBytes)}.`;
+    await renderWorldBackupPanel();
+  } catch (error) {
+    status.textContent = `Could not create a backup: ${error}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function openWorldRestoreReview(backupId) {
+  const review = $('#world-restore-review');
+  const select = $('#world-backup-profile');
+  if (!review || !select) return;
+  const profileKey = select.value || null;
+  select.disabled = true;
+  review.hidden = false;
+  review.innerHTML = '<div class="world-restore-loading">Inspecting the backup and checking for same-named worlds…</div>';
+  try {
+    const preview = await invoke('inspect_world_backup', { backupId, profileKey });
+    worldRestoreReview = { backupId, profileKey, preview };
+    const conflicts = preview.worlds.filter((world) => world.destinationExists).length;
+    review.innerHTML = `<div class="world-restore-heading"><div><b>Review restore</b><small>${escapeHtml(new Date(preview.backup.createdAt * 1000).toLocaleString())} · ${preview.worlds.length} world${preview.worlds.length === 1 ? '' : 's'}</small></div><button class="btn subtle" id="world-restore-cancel">Cancel</button></div><div class="world-restore-risk ${conflicts ? 'has-conflicts' : ''}">${conflicts ? `${conflicts} selected destination${conflicts === 1 ? '' : 's'} already exist and will be replaced. Bee will first create a separate safety backup of those existing worlds.` : 'No same-named worlds exist in this destination.'} Close Minecraft before restoring; selected worlds will be copied into this profile's saves folder.</div><div class="world-restore-worlds">${preview.worlds.map((world) => `<label class="world-restore-row"><input type="checkbox" class="world-restore-choice" value="${escapeHtml(world.name)}" checked><span><b>${escapeHtml(world.name)}</b><small>${world.files} files · ${formatFileSize(world.bytes)}${world.destinationExists ? ' · WILL REPLACE EXISTING WORLD' : ''}</small></span></label>`).join('')}</div><label class="world-restore-confirm-row"><input type="checkbox" id="world-restore-ack"><span>I reviewed the selected worlds and want to restore them.</span></label><div class="world-restore-actions"><button class="btn" id="world-restore-cancel-bottom">Cancel</button><button class="btn pri" id="world-restore-confirm" disabled>Restore selected worlds</button></div>`;
+    const confirm = $('#world-restore-confirm');
+    const acknowledgement = $('#world-restore-ack');
+    const updateConfirm = () => { confirm.disabled = !acknowledgement.checked || !review.querySelector('.world-restore-choice:checked'); };
+    acknowledgement.addEventListener('change', updateConfirm);
+    review.querySelectorAll('.world-restore-choice').forEach((checkbox) => checkbox.addEventListener('change', updateConfirm));
+    $('#world-restore-cancel').addEventListener('click', closeWorldRestoreReview);
+    $('#world-restore-cancel-bottom').addEventListener('click', closeWorldRestoreReview);
+    confirm.addEventListener('click', confirmWorldRestore);
+  } catch (error) {
+    worldRestoreReview = null;
+    review.innerHTML = `<div class="world-restore-loading error">Could not inspect this backup: ${escapeHtml(String(error))}</div><button class="btn" id="world-restore-cancel">Close</button>`;
+    $('#world-restore-cancel').addEventListener('click', closeWorldRestoreReview);
+  }
+}
+
+function closeWorldRestoreReview() {
+  worldRestoreReview = null;
+  const review = $('#world-restore-review');
+  if (review) { review.hidden = true; review.innerHTML = ''; }
+  const select = $('#world-backup-profile');
+  if (select) select.disabled = false;
+}
+
+async function confirmWorldRestore() {
+  if (!worldRestoreReview) return;
+  const review = $('#world-restore-review');
+  const acknowledgement = $('#world-restore-ack');
+  const selectedWorlds = [...review.querySelectorAll('.world-restore-choice:checked')].map((checkbox) => checkbox.value);
+  if (!acknowledgement?.checked || selectedWorlds.length === 0) return;
+  const button = $('#world-restore-confirm');
+  button.disabled = true;
+  button.textContent = 'Restoring…';
+  try {
+    const result = await invoke('restore_world_backup', {
+      backupId: worldRestoreReview.backupId,
+      profileKey: worldRestoreReview.profileKey,
+      selectedWorlds,
+    });
+    const status = $('#world-backup-status');
+    if (status) status.textContent = `Restored ${result.restoredWorlds.join(', ')}.${result.safetyBackupId ? ` Replaced worlds were saved first as ${result.safetyBackupId}.` : ''}`;
+    closeWorldRestoreReview();
+    await renderWorldBackupPanel();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Restore selected worlds';
+    const status = $('#world-backup-status');
+    if (status) status.textContent = `Restore stopped without replacing worlds: ${error}`;
+  }
+}
+
 function settingsMarkup() {
   const options = wallpaperOptions.map((item) => `<button class="wallpaper-card" data-wallpaper="${item.id}" aria-pressed="false"><img src="${escapeHtml(item.src)}" alt=""><span>${escapeHtml(item.name)}</span></button>`).join('');
   const accents = Object.entries(accentColors).map(([key, color]) => `<button class="accent-swatch" data-accent="${key}" aria-label="${key} accent" title="${key[0].toUpperCase()}${key.slice(1)}" aria-pressed="${key === appearance.accent}" style="background:linear-gradient(${color[3]},${color[2]})"></button>`).join('');
+  const profileMemoryOptions = `<option value="">Use launcher default (${settings.maxMemoryGb || 4} GB)</option>${Array.from({ length: 16 }, (_, index) => `<option value="${index + 1}">${index + 1} GB</option>`).join('')}`;
   return `${panelHeader('Settings', 'Make Bee Launcher yours')}
     <div class="settings-layout">
       <nav class="settings-rail" aria-label="Settings sections">
-        <button data-settings-tab="profile" aria-controls="settings-profile" aria-current="page"><span class="rail-mark">1</span><span>Profile</span></button>
-        <button data-settings-tab="game" aria-controls="settings-game"><span class="rail-mark">2</span><span>Game</span></button>
-        <button data-settings-tab="appearance" aria-controls="settings-appearance"><span class="rail-mark">3</span><span>Appearance</span></button>
-        <button data-settings-tab="folder" aria-controls="settings-folder-page"><span class="rail-mark">4</span><span>Minecraft folder</span></button>
-        <button data-settings-tab="about" aria-controls="settings-about"><span class="rail-mark">i</span><span>About</span></button>
+        <div class="settings-rail-heading"><small>LAUNCHER PREFERENCES</small><b>Setup workspace</b></div>
+        <button data-settings-tab="profile" aria-controls="settings-profile" aria-current="page"><span class="rail-mark" aria-hidden="true">◉</span><span>Profile</span></button>
+        <button data-settings-tab="game" aria-controls="settings-game"><span class="rail-mark" aria-hidden="true">▣</span><span>Game</span></button>
+        <button data-settings-tab="appearance" aria-controls="settings-appearance"><span class="rail-mark" aria-hidden="true">✳</span><span>Appearance</span></button>
+        <button data-settings-tab="folder" aria-controls="settings-folder-page"><span class="rail-mark" aria-hidden="true">▱</span><span>Minecraft folder</span></button>
+        <button data-settings-tab="about" aria-controls="settings-about"><span class="rail-mark" aria-hidden="true">?</span><span>About</span></button>
+        <div class="settings-rail-status"><span class="settings-local-dot"></span><div><b>Saved on this PC</b><small>Your launcher stays local</small></div></div>
       </nav>
       <div class="settings-pages">
         <section class="settings-page active" id="settings-profile" data-settings-page="profile">
-          <div class="section-intro"><h3>Your local profile</h3><p>Choose how you appear in this launcher and in offline play.</p></div>
+          <div class="settings-page-heading"><div><small>PLAYER</small><h3>Your profile</h3><p>Set the name and picture used by this local launcher.</p></div><span class="settings-chip"><i></i> LOCAL PROFILE</span></div>
           <div class="setting-card profile-card">
-            <div class="field-stack"><label for="settings-username">Player name</label><input class="fld" id="settings-username" maxlength="16" autocomplete="off" value="${escapeHtml(playerName())}" placeholder="Your Minecraft name"><small>Use 3–16 letters, numbers, or underscores.</small></div>
-            <div class="avatar-card"><span class="face" id="avatar-preview" aria-label="Profile picture preview"></span><div class="avatar-copy"><b>Profile picture</b><small>Shown here only; it stays on this PC.</small><div class="button-pair"><button class="btn" id="avatar-upload">Choose picture</button><button class="btn subtle" id="avatar-reset">Reset</button></div></div></div>
+            <div class="field-stack"><label for="settings-username">Player name</label><input class="fld" id="settings-username" maxlength="16" autocomplete="off" value="${escapeHtml(playerName())}" placeholder="Your Minecraft name"><small>3–16 letters, numbers, or underscores. Used for local offline play.</small><span class="field-local-hint"><i>✓</i> Stored only on this PC</span></div>
+            <div class="avatar-card"><span class="face" id="avatar-preview" aria-label="Profile picture preview"></span><div class="avatar-copy"><b>Profile picture</b><small>Personalize the launcher avatar. It does not change your Minecraft skin.</small><div class="button-pair"><button class="btn" id="avatar-upload">Choose picture</button><button class="btn subtle" id="avatar-reset">Reset</button></div></div></div>
           </div>
-          <div class="local-note"><span class="note-mark">i</span><span>This is a local, offline profile. Bee Launcher does not read or store Microsoft or TLauncher sign-in tokens.</span></div>
+          <div class="settings-callout"><span class="note-mark">i</span><span>Bee Launcher does not connect to Microsoft or TLauncher accounts, or read their sign-in tokens.</span></div>
         </section>
         <section class="settings-page" id="settings-game" data-settings-page="game" hidden>
-          <div class="section-intro"><h3>Game launch</h3><p>These options are used the next time you start a profile.</p></div>
+          <div class="settings-page-heading"><div><small>LAUNCH BEHAVIOUR</small><h3>Game settings</h3><p>Choose the defaults used the next time you start Minecraft.</p></div></div>
           <div class="setting-card setting-list">
-            <div class="setting-row"><div><label for="memory-range">Memory limit</label><small>Maximum memory given to Minecraft.</small></div><div class="range-control"><output id="memory-value">${settings.maxMemoryGb || 4} GB</output><input type="range" id="memory-range" min="1" max="16" step="1" value="${settings.maxMemoryGb || 4}" aria-label="Maximum memory"></div></div>
-            <div class="setting-row"><div><label for="resolution-width">Window size</label><small>Width and height in pixels.</small></div><div class="resolution-inputs"><input class="fld" type="number" min="800" max="7680" id="resolution-width" aria-label="Window width" value="${settings.width || 1280}"><span>×</span><input class="fld" type="number" min="600" max="4320" id="resolution-height" aria-label="Window height" value="${settings.height || 720}"></div></div>
-            <div class="setting-row"><div><label for="fullscreen">Start in fullscreen</label><small>You can change this later in Minecraft.</small></div><label class="tg"><input type="checkbox" id="fullscreen" ${settings.fullscreen ? 'checked' : ''}><i></i></label></div>
+            <div class="setting-row"><div><label for="memory-range">Default memory limit</label><small>Used by profiles without their own memory override.</small></div><div class="range-control"><output id="memory-value">${settings.maxMemoryGb || 4} GB</output><input type="range" id="memory-range" min="1" max="16" step="1" value="${settings.maxMemoryGb || 4}" aria-label="Default maximum memory"></div></div>
+            <div class="setting-row"><div><label for="resolution-width">Game window size</label><small>Choose the launch window dimensions in pixels.</small></div><div class="resolution-inputs"><input class="fld" type="number" min="800" max="7680" id="resolution-width" aria-label="Window width" value="${settings.width || 1280}"><span>×</span><input class="fld" type="number" min="600" max="4320" id="resolution-height" aria-label="Window height" value="${settings.height || 720}"></div></div>
+            <div class="setting-row"><div><label for="fullscreen">Start in fullscreen</label><small>Open the game without a window frame.</small></div><label class="tg"><input type="checkbox" id="fullscreen" ${settings.fullscreen ? 'checked' : ''}><i></i></label></div>
           </div>
-          <div class="local-note"><span class="note-mark">i</span><span>Changing memory is not a guarantee of higher performance; the profile and Java runtime still determine whether a game can launch.</span></div>
+          <div class="setting-card profile-launch-card">
+            <div class="profile-launch-heading"><div><h4>Profile-specific performance</h4><p>Choose a Java runtime, memory limit, and graphics preset for each installed profile.</p></div><span class="settings-chip">PER PROFILE</span></div>
+            <div class="field-stack profile-select-stack"><label for="profile-launch-select">Installed profile</label><select class="fld" id="profile-launch-select" aria-label="Profile to configure"><option value="">Loading profiles…</option></select></div>
+            <div class="profile-launch-grid">
+              <div class="profile-setting"><label for="profile-memory">Memory for this profile</label><small>Overrides the default memory above.</small><select class="fld" id="profile-memory">${profileMemoryOptions}</select></div>
+              <div class="profile-setting profile-java-setting"><label>Java runtime</label><small id="profile-java-hint">Automatic Java is selected to match this profile.</small><div class="profile-java-path" id="profile-java-value">Automatic detection</div><div class="button-pair"><button class="btn" id="profile-java-choose">Choose Java…</button><button class="btn subtle" id="profile-java-reset">Automatic</button></div></div>
+              <div class="profile-setting"><label for="profile-graphics">Graphics preset</label><small>Low-impact settings are written before this profile starts and restored when you switch back to default.</small><select class="fld" id="profile-graphics"><option value="default">Keep current game settings</option><option value="intel-uhd-low">Intel UHD · low impact</option></select></div>
+            </div>
+            <div class="profile-preset-note" id="profile-preset-note" role="status">No profile selected yet.</div>
+          </div>
+          <div class="settings-callout"><span class="note-mark">i</span><span>Java overrides must match the profile's required major version. The Intel UHD preset targets integrated graphics with 6-chunk view distance, 4-chunk simulation, low effects, and a 60 FPS cap.</span></div>
+          <div class="crash-helper-card"><div><h4>Last launch diagnostics</h4><p>Analyze the selected profile's local Bee Launcher log. The explanation is rule-based and shows a redacted excerpt.</p></div><button class="btn" id="diagnose-last-launch">Explain last launch</button><div class="crash-diagnosis" id="crash-diagnosis" role="status" hidden></div></div>
         </section>
         <section class="settings-page" id="settings-appearance" data-settings-page="appearance" hidden>
-          <div class="section-intro"><h3>Make it yours</h3><p>Wallpaper and appearance changes preview immediately and save on this PC.</p></div>
-          <div class="setting-card appearance-card"><div class="card-heading"><h4>Wallpaper</h4><p>Pick a scene or use one of your own images.</p></div><div class="thumbs" id="wallpaper-grid">${options}</div><div class="wallpaper-actions"><span class="path-value" id="wallpaper-name">Built-in design wallpaper</span><div class="button-pair"><button class="btn" id="wallpaper-select">Choose image</button><button class="btn subtle" id="wallpaper-reset">Restore</button></div></div></div>
-          <div class="setting-card setting-list appearance-controls"><div class="setting-row"><div><h4>Play button colour</h4><small>Choose an accent colour.</small></div><div class="swatches" id="accent-swatches">${accents}</div></div><div class="setting-row"><div><label for="glass-opacity">Panel opacity</label><small>Higher values make glass easier to read.</small></div><div class="range-control"><output id="glass-opacity-value">${appearance.opacity}%</output><input type="range" id="glass-opacity" min="20" max="90" value="${appearance.opacity}" aria-label="Panel opacity"></div></div><div class="setting-row"><div><label for="wallpaper-brightness">Wallpaper brightness</label><small>Adjust the scene behind the controls.</small></div><div class="range-control"><output id="wallpaper-brightness-value">${appearance.brightness}%</output><input type="range" id="wallpaper-brightness" min="60" max="120" value="${appearance.brightness}" aria-label="Wallpaper brightness"></div></div></div>
+          <div class="settings-page-heading"><div><small>LOOK & FEEL</small><h3>Appearance</h3><p>Preview your changes as you make them; they save automatically.</p></div><span class="settings-chip settings-chip-live"><i></i> AUTO-SAVING</span></div>
+          <div class="setting-card appearance-card"><div class="card-heading"><h4>Launcher wallpaper</h4><p>Choose a built-in scene or use an image from your PC.</p></div><div class="thumbs" id="wallpaper-grid">${options}</div><div class="wallpaper-actions"><span class="path-value" id="wallpaper-name">Built-in design wallpaper</span><div class="button-pair"><button class="btn" id="wallpaper-select">Choose image</button><button class="btn subtle" id="wallpaper-reset">Restore default</button></div></div></div>
+          <div class="setting-card setting-list appearance-controls"><div class="setting-row"><div><h4>Play button colour</h4><small>Choose the launcher accent colour.</small></div><div class="swatches" id="accent-swatches">${accents}</div></div><div class="setting-row"><div><label for="glass-opacity">Panel opacity</label><small>Increase it for a clearer, more readable panel.</small></div><div class="range-control"><output id="glass-opacity-value">${appearance.opacity}%</output><input type="range" id="glass-opacity" min="20" max="90" value="${appearance.opacity}" aria-label="Panel opacity"></div></div><div class="setting-row"><div><label for="wallpaper-brightness">Wallpaper brightness</label><small>Adjust the background behind the controls.</small></div><div class="range-control"><output id="wallpaper-brightness-value">${appearance.brightness}%</output><input type="range" id="wallpaper-brightness" min="60" max="120" value="${appearance.brightness}" aria-label="Wallpaper brightness"></div></div></div>
         </section>
         <section class="settings-page" id="settings-folder-page" data-settings-page="folder" hidden>
-          <div class="section-intro"><h3>Minecraft folder</h3><p>Bee Launcher reads the installed profiles already on this PC.</p></div>
-          <div class="setting-card folder-card"><div class="folder-icon" aria-hidden="true"><span></span><span></span><span></span></div><div class="folder-details"><b>Current game folder</b><p class="path-value" id="settings-path">${escapeHtml(friendlyPath(appStatus.gameDirectory))}</p><small>Auto-detection checks the populated Roaming and LocalAppData folders.</small></div><div class="folder-actions"><button class="btn" id="settings-folder">Choose folder</button><button class="btn subtle" id="settings-rescan">Rescan</button></div></div>
-          <div class="folder-status"><div><span class="status-dot" id="java-dot"></span><span id="java-status">Checking Java…</span></div><div><b id="profile-count">${appStatus.installedVersions.length}</b><span>installed profiles found</span></div></div>
-          <div class="local-note"><span class="note-mark">i</span><span>Choosing a different folder does not move, delete, or change your existing worlds, mods, or settings.</span></div>
+          <div class="settings-page-heading"><div><small>LOCAL FILES</small><h3>Minecraft folder</h3><p>Choose the existing game folder Bee Launcher should scan.</p></div></div>
+          <div class="setting-card folder-card"><div class="folder-icon" aria-hidden="true"><span></span><span></span><span></span></div><div class="folder-details"><b>Current game folder</b><p class="path-value" id="settings-path">${escapeHtml(friendlyPath(appStatus.gameDirectory))}</p><small>Auto-detection checks your populated Roaming and LocalAppData folders.</small></div><div class="folder-actions"><button class="btn" id="settings-folder">Choose folder</button><button class="btn subtle" id="settings-rescan">Rescan profiles</button></div></div>
+          <div class="folder-status"><div><span class="status-dot" id="java-dot"></span><span id="java-status">Checking Java…</span></div><div><b id="profile-count">${appStatus.installedVersions.length}</b><span>profiles detected</span></div></div>
+          <div class="settings-callout"><span class="note-mark">i</span><span>Changing this location does not move or delete your existing worlds, mods, saves, or settings.</span></div>
         </section>
         <section class="settings-page" id="settings-about" data-settings-page="about" hidden>
-          <div class="section-intro"><h3>About Bee Launcher</h3><p>A small local launcher for Minecraft Java profiles installed on this device.</p></div>
-          <div class="about-grid"><article class="setting-card"><span class="about-badge available">Available</span><h4>What works here</h4><ul><li>Installed vanilla and Fabric profiles</li><li>Local player name and profile picture</li><li>Wallpaper and launch preferences</li><li>Profile-declared file checks and repair</li></ul></article><article class="setting-card"><span class="about-badge limited">Not supported</span><h4>Online account features</h4><ul><li>Microsoft or TLauncher sign-in</li><li>Servers that require authenticated accounts</li><li>Cloud skins, Realms, and online services</li></ul></article></div>
-          <div class="local-note"><span class="note-mark">i</span><span>Offline mode does not make a profile compatible by itself. Minecraft and Java files must still be present and valid.</span></div>
+          <div class="settings-page-heading"><div><small>INFORMATION</small><h3>About Bee Launcher</h3><p>A local launcher for Java profiles already installed on this PC.</p></div></div>
+          <div class="about-grid"><article class="setting-card"><span class="about-badge available">SUPPORTED</span><h4>Local launcher features</h4><ul><li>Installed vanilla and Fabric profiles</li><li>Local player name and custom skin library</li><li>Wallpaper and game launch preferences</li><li>Profile file checks and repair where supported</li><li>Separate modpack profiles</li></ul></article><article class="setting-card"><span class="about-badge limited">NOT CONNECTED</span><h4>Online account features</h4><ul><li>Microsoft or TLauncher sign-in</li><li>Servers requiring account authentication</li><li>Cloud skins, Realms, or online services</li></ul></article></div>
+          <div class="settings-callout"><span class="note-mark">i</span><span>Offline mode does not replace missing game files or Java. Each installed profile must still be complete and compatible.</span></div>
         </section>
       </div>
     </div>
-    <div class="settings-footer"><span>Appearance saves as you change it. Player and game settings save when you choose Save changes.</span><div class="button-pair"><button class="btn subtle" id="close-settings">Close</button><button class="btn pri" id="save-settings">Save changes</button></div></div>`;
+    <div class="settings-footer"><span>Profile and game options save with this button. Appearance changes save instantly.</span><div class="button-pair"><button class="btn subtle" id="close-settings">Close</button><button class="btn pri" id="save-settings">Save changes</button></div></div>`;
 }
 
 function bindSettings() {
@@ -603,6 +891,12 @@ function bindSettings() {
     });
   }));
   $('#memory-range').addEventListener('input', (event) => { $('#memory-value').textContent = `${event.target.value} GB`; });
+  $('#profile-launch-select').addEventListener('change', (event) => { profileLaunchSelectedKey = event.target.value; renderProfileLaunchControls(); });
+  $('#profile-memory').addEventListener('change', (event) => updateProfileLaunchDraft('maxMemoryGb', event.target.value === '' ? null : Number(event.target.value)));
+  $('#profile-graphics').addEventListener('change', (event) => updateProfileLaunchDraft('graphicsPreset', event.target.value));
+  $('#profile-java-choose').addEventListener('click', pickProfileJava);
+  $('#profile-java-reset').addEventListener('click', () => updateProfileLaunchDraft('javaPath', null));
+  $('#diagnose-last-launch').addEventListener('click', explainLastLaunch);
   $('#glass-opacity').addEventListener('input', (event) => {
     appearance.opacity = Number(event.target.value);
     $('#glass-opacity-value').textContent = `${appearance.opacity}%`;
@@ -637,12 +931,20 @@ async function saveSettings() {
     return;
   }
   try {
-    const saved = await invoke('save_launcher_settings', {
+    let saved = await invoke('save_launcher_settings', {
       maxMemoryGb: Number($('#memory-range').value),
       width,
       height,
       fullscreen: $('#fullscreen').checked,
     });
+    const availableProfileKeys = new Set((appStatus.installedVersions || []).map(profileKeyOf));
+    for (const key of availableProfileKeys) {
+      const next = profileLaunchDrafts[key] || profileLaunchSettings[key] || { javaPath: null, maxMemoryGb: null, graphicsPreset: 'default' };
+      const previous = profileLaunchSettings[key] || { javaPath: null, maxMemoryGb: null, graphicsPreset: 'default' };
+      if (next.javaPath === previous.javaPath && next.maxMemoryGb === previous.maxMemoryGb && (next.graphicsPreset || 'default') === (previous.graphicsPreset || 'default')) continue;
+      saved = await invoke('save_profile_launch_settings', { profileKey: key, profileSettings: next });
+      profileLaunchSettings = structuredClone(saved.profileSettings || {});
+    }
     reflectSettings(saved);
     updateProfileName(name);
     openPanel('play');
@@ -861,7 +1163,7 @@ async function loadCustomSkins() {
         return skin;
       }
     }));
-    activeSkinId = customSkins.some((skin) => skin.id === library.activeSkinId) ? library.activeSkinId : null;
+    activeSkinId = customSkins.some((skin) => skin.id === library.activeSkinId && skin.faceDataUrl && skin.dataUrl) ? library.activeSkinId : null;
     renderAvatar();
     refreshSkinPreview();
     renderCustomSkins();
@@ -873,6 +1175,12 @@ async function loadCustomSkins() {
 function refreshSkinPreview() {
   const skin = customSkins.find((item) => item.id === activeSkinId);
   setSkinPreview(skin?.dataUrl || null, skin?.name || 'Default skin');
+}
+
+async function initializePlayerSkinPreview() {
+  await loadCustomSkins();
+  const activeSkin = customSkins.find((skin) => skin.id === activeSkinId && skin.faceDataUrl && skin.dataUrl);
+  await initializeSkinPreview($('#skin-canvas'), $('#skin-showcase'), activeSkin ? { dataUrl: activeSkin.dataUrl, name: activeSkin.name } : null);
 }
 
 function renderCustomSkins() {
@@ -982,14 +1290,56 @@ async function applyCustomSkinToMinecraft(skinId) {
       username: name,
       skinId,
     });
+    lastAppliedSkin = { profileKey: selectedVersion, username: result.username, skinId };
     const backupNote = result.replacedExisting ? ' The previous local skin was backed up in Bee Launcher app data.' : '';
     const configBackupNote = result.configBackupCreated ? ' The previous CustomSkinLoader config was backed up in Bee Launcher app data.' : '';
-    const refreshNote = result.restartRequired
-      ? ' Fully quit Minecraft and start it again once so CustomSkinLoader reads the LocalSkin-first order.'
-      : ' LocalSkin is already first; leave the current world and reopen it to refresh the skin.';
-    notify(`Skin file applied for offline player ${result.username}.${refreshNote} Other players will not see this local skin.${backupNote}${configBackupNote}`, 11000);
+    const card = $('#skin-application-card');
+    if (card) {
+      card.hidden = false;
+      card.innerHTML = `<div class="skin-application-heading"><div><span class="news-card-source">STAGED · NOT YET CONFIRMED IN-GAME</span><h3>Skin file and load order checked</h3><p>Bee verified that this profile's LocalSkin PNG matches your selected library image and that CustomSkinLoader can prioritize it. This does not prove Minecraft has loaded or rendered it yet.</p></div><button class="btn" id="verify-custom-skin">Check loader log</button></div><div class="skin-stage-details"><div><b>Player</b><span>${escapeHtml(result.username)}</span></div><div><b>Profile</b><span>${escapeHtml(result.profileId)}</span></div><div><b>Skin file</b><code>${escapeHtml(result.skinPath)}</code></div><div><b>Loader config</b><code>${escapeHtml(result.loaderConfigPath)}</code></div></div><div class="skin-application-result" id="skin-application-result" role="status">Fully quit Minecraft, launch this profile, and open a world. Then check the loader's own log here. ${result.restartRequired ? 'The LocalSkin priority was newly prepared, so a full restart is required.' : 'A full restart is the safest way to refresh the current profile cache.'}${backupNote}${configBackupNote}</div>`;
+      $('#verify-custom-skin').addEventListener('click', verifyCustomSkinApplication);
+    }
+    notify(`Skin staged for ${result.username}. Bee verified the local PNG and loader order, but has not confirmed Minecraft loaded it.`, 10000);
   } catch (error) {
-    notify(`Could not apply this in-game skin: ${error}`, 10000);
+    notify(`Could not stage this in-game skin: ${error}`, 10000);
+  }
+}
+
+async function verifyCustomSkinApplication() {
+  if (!lastAppliedSkin) return;
+  const output = $('#skin-application-result');
+  const button = $('#verify-custom-skin');
+  if (!output || !button) return;
+  output.textContent = 'Checking the selected profile’s CustomSkinLoader log…';
+  button.disabled = true;
+  try {
+    const result = await invoke('verify_custom_skin_application', lastAppliedSkin);
+    let message;
+    if (result.loadConfirmed) {
+      message = 'Confirmed by CustomSkinLoader’s fresh log: the profile selected the exact local skin file for this player. This confirms the loader reference, not the final rendered appearance in Minecraft.';
+    } else if (!result.fileMatchesLibrary || !result.loadOrderReady) {
+      message = 'The local file or source priority no longer matches the staged setup. Apply the skin again before testing in-game.';
+    } else if (!result.loaderLogFound) {
+      message = 'No CustomSkinLoader log exists yet. Fully quit Minecraft, launch this profile, open a world, then check again.';
+    } else if (!result.loaderLogUpdatedAfterSkin) {
+      message = 'The loader log predates the current skin file, so it cannot confirm this copy. Launch this profile and open a world, then check again.';
+    } else if (!result.matchingSkinFingerprint) {
+      message = 'A newer loader log exists, but it does not contain the exact fingerprint for this skin file. Check that the player name in Settings matches the name Minecraft is using, then fully restart the profile.';
+    } else {
+      message = 'The load could not be confirmed from the available evidence.';
+    }
+    const checks = [
+      `${result.fileMatchesLibrary ? '✓' : '×'} PNG still matches the selected library skin`,
+      `${result.loadOrderReady ? '✓' : '×'} LocalSkin priority is ready`,
+      `${result.loaderLogFound ? '✓' : '×'} CustomSkinLoader log found`,
+      `${result.loaderLogUpdatedAfterSkin ? '✓' : '×'} Log is newer than the staged file`,
+      `${result.matchingSkinFingerprint ? '✓' : '×'} Exact file fingerprint appears in the log`,
+    ];
+    output.innerHTML = `<p class="${result.loadConfirmed ? 'verified' : 'unverified'}">${escapeHtml(message)}</p><ul>${checks.map((check) => `<li>${escapeHtml(check)}</li>`).join('')}</ul><small>Loader log: ${escapeHtml(result.loaderLogPath)}</small>`;
+  } catch (error) {
+    output.textContent = `Could not verify the CustomSkinLoader log: ${error}`;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1048,13 +1398,6 @@ function showSettings() {
   updateSettingsPath();
 }
 
-function toggleNews(force) {
-  const drawer = $('#drawer');
-  const openState = typeof force === 'boolean' ? force : !drawer.classList.contains('open');
-  drawer.classList.toggle('open', openState);
-  $('#news-button').setAttribute('aria-expanded', String(openState));
-  $('#chev').style.transform = openState ? 'rotate(180deg)' : '';
-}
 
 versionSelect.addEventListener('change', () => {
   selectedVersion = versionSelect.value;
@@ -1067,22 +1410,18 @@ $('#settings-shortcut').addEventListener('click', showSettings);
 bindWindowControls();
 restoreWindowSize();
 applyDefaultWindowIcon();
-$('#news-button').addEventListener('click', () => toggleNews());
-$('#news-close').addEventListener('click', () => toggleNews(false));
 document.querySelectorAll('#sub button[data-s]').forEach((button) => button.addEventListener('click', () => {
   const tab = button.dataset.s;
   if (tab === 'play') openPanel('play');
   else if (tab === 'inst') openPanel('inst');
-  else if (tab === 'realms' || tab === 'skins' || tab === 'mods' || tab === 'servers' || tab === 'notes') {
-    const title = tab === 'notes' ? 'Patch notes' : tab[0].toUpperCase() + tab.slice(1);
-    openPanel(tab, title);
+  else if (tab === 'notes') openPanel('notes');
+  else if (tab === 'news') openPanel('news');
+  else if (tab === 'realms' || tab === 'skins' || tab === 'mods' || tab === 'servers') {
+    openPanel(tab, tab[0].toUpperCase() + tab.slice(1));
   }
 }));
 window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') {
-    toggleNews(false);
-    if (activePanel !== 'play') openPanel('play');
-  }
+  if (event.key === 'Escape' && activePanel !== 'play') openPanel('play');
 });
 sheet.addEventListener('click', (event) => {
   if (event.target.closest('[data-close-panel]')) openPanel('play');
@@ -1091,8 +1430,7 @@ sheet.addEventListener('click', (event) => {
 updateProfileName(playerName());
 applyAppearance();
 initializeReferenceArtwork();
-initializeSkinPreview($('#skin-canvas'), $('#skin-showcase'));
 applyStockWallpaper(appearance.wallpaper);
 refreshStatus();
 loadPreferences();
-loadCustomSkins();
+initializePlayerSkinPreview();
