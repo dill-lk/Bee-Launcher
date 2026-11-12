@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.25', date: '2026-11-12', title: 'Readable, scrollable windows',
+    changes: [
+      'Made Settings, Mods, Skins, Installations, News, and Patch Notes scroll cleanly without clipping long text or controls.',
+      'Set the desktop launcher interface to an 80% default scale and improved narrow-window text wrapping.',
+    ],
+  },
+  {
     version: '0.1.24', date: '2026-11-11', title: 'Performance, safety, and news',
     changes: [
       'Redesigned Settings and added per-profile Java, memory, and graphics choices.',
@@ -614,36 +621,40 @@ function openPanel(name, title = '') {
     reflectSettings(settings);
     renderProfileLaunchControls();
   } else if (name === 'inst') {
-    sheet.innerHTML = `${panelHeader('Installations', 'Local Minecraft profiles and imported packs')}<div class="profile-list" id="installations-list"></div><div class="panel-actions"><button class="btn" id="rescan-button">Rescan</button><button class="btn" id="choose-folder-modal">Choose folder</button><button class="btn pri" id="import-modpack-from-inst">Import Modpack</button></div>`;
+    sheet.innerHTML = `${panelHeader('Installations', 'Local Minecraft profiles and imported packs')}<div class="panel-scroll"><div class="profile-list" id="installations-list"></div><div class="panel-actions"><button class="btn" id="rescan-button">Rescan</button><button class="btn" id="choose-folder-modal">Choose folder</button><button class="btn pri" id="import-modpack-from-inst">Import Modpack</button></div></div>`;
     renderInstallations();
     $('#rescan-button').addEventListener('click', () => refreshStatus(true));
     $('#choose-folder-modal').addEventListener('click', pickGameFolder);
     $('#import-modpack-from-inst').addEventListener('click', () => openPanel('mods'));
   } else if (name === 'mods') {
     sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or Bee Launcher ZIP')}
+      <div class="panel-scroll">
       <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>The pack gets its own game folder. Your existing .minecraft mods, configs, and saves stay untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose .mrpack or ZIP</button>
         <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">ZIPs reuse installed Minecraft files; .mrpacks may download missing files.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
       <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>
-      <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>`;
+      <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>
+      </div>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);
     renderImportedPacks();
     $('#create-world-backup').addEventListener('click', createWorldBackup);
     renderWorldBackupPanel();
   } else if (name === 'news') {
-    sheet.innerHTML = `${panelHeader('Minecraft News', 'Official announcements from Minecraft.net')}<div class="news-page-toolbar"><p>News loads only when you open this page or choose Refresh.</p><button class="btn" id="refresh-minecraft-news">Refresh news</button></div><div class="minecraft-news-status" id="minecraft-news-status" role="status">Loading official news…</div><div class="minecraft-news-grid" id="minecraft-news-grid"></div>`;
+    sheet.innerHTML = `${panelHeader('Minecraft News', 'Official announcements from Minecraft.net')}<div class="panel-scroll"><div class="news-page-toolbar"><p>News loads only when you open this page or choose Refresh.</p><button class="btn" id="refresh-minecraft-news">Refresh news</button></div><div class="minecraft-news-status" id="minecraft-news-status" role="status">Loading official news…</div><div class="minecraft-news-grid" id="minecraft-news-grid"></div></div>`;
     $('#refresh-minecraft-news').addEventListener('click', loadMinecraftNews);
     loadMinecraftNews();
   } else if (name === 'notes') {
-    sheet.innerHTML = `${panelHeader('Patch Notes', 'Bee Launcher releases')}<div class="patch-notes-intro"><b>Local release history</b><p>These notes describe changes to Bee Launcher. Minecraft game snapshots and release notes are published on the official News page.</p></div><div class="patch-notes-list">${renderPatchNotes()}</div>`;
+    sheet.innerHTML = `${panelHeader('Patch Notes', 'Bee Launcher releases')}<div class="panel-scroll"><div class="patch-notes-intro"><b>Local release history</b><p>These notes describe changes to Bee Launcher. Minecraft game snapshots and release notes are published on the official News page.</p></div><div class="patch-notes-list">${renderPatchNotes()}</div></div>`;
   } else if (name === 'skins') {
     sheet.innerHTML = `${panelHeader('Custom skins', 'Local skins for your Bee profile')}
+      <div class="panel-scroll">
       <div class="skin-heading"><div class="section-intro"><h3>Your skin library</h3><p>Add a Minecraft skin PNG for the launcher avatar, or apply it in-game when CustomSkinLoader is installed.</p></div><button class="btn pri" id="skin-add">Add skin PNG</button></div>
       <div class="skin-support" id="skin-support-status" role="status" aria-live="polite"></div>
       <div class="custom-skin-grid" id="custom-skin-grid"></div>
       <section class="skin-application-card" id="skin-application-card" hidden></section>
-      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's LocalSkin folder and work only on this client; other players will not see them. On first apply, Bee moves LocalSkin ahead of online skin sources because the default order can ignore the local file. Existing config is backed up before changes; if it does not exist yet, Bee stages a one-use ExtraList entry. Bee checks the copied PNG and source order, but the loader log is checked separately after you fully restart Minecraft and open a world. Bee does not sign in, upload skins, install/update mods, or change worlds, profile JSON, or authentication. Same-name LocalSkin images are backed up before replacement; removing a library skin does not delete an already-applied file.</span></div>`;
+      <div class="local-note"><span class="note-mark">i</span><span>In-game skins use CustomSkinLoader's LocalSkin folder and work only on this client; other players will not see them. On first apply, Bee moves LocalSkin ahead of online skin sources because the default order can ignore the local file. Existing config is backed up before changes; if it does not exist yet, Bee stages a one-use ExtraList entry. Bee checks the copied PNG and source order, but the loader log is checked separately after you fully restart Minecraft and open a world. Bee does not sign in, upload skins, install/update mods, or change worlds, profile JSON, or authentication. Same-name LocalSkin images are backed up before replacement; removing a library skin does not delete an already-applied file.</span></div>
+      </div>`;
     renderCustomSkins();
     refreshCustomSkinSupport();
     $('#skin-add').addEventListener('click', addCustomSkin);
@@ -652,7 +663,7 @@ function openPanel(name, title = '') {
       realms: 'Realms is not available in this local launcher. It only starts profiles already installed on this device.',
       servers: 'This local launcher does not browse or join servers. Online play requiring Microsoft or TLauncher authentication is unsupported.',
     };
-    sheet.innerHTML = `${panelHeader(title || 'Unavailable')}<div class="item"><span class="dot" style="background:#ffcf4a"></span><div><b>Not part of this local build</b><small>${escapeHtml(messages[name] || 'This feature is not available in this local launcher.')}</small></div></div>`;
+    sheet.innerHTML = `${panelHeader(title || 'Unavailable')}<div class="panel-scroll"><div class="item"><span class="dot" style="background:#ffcf4a"></span><div><b>Not part of this local build</b><small>${escapeHtml(messages[name] || 'This feature is not available in this local launcher.')}</small></div></div></div>`;
   }
   const close = sheet.querySelector('[data-close-panel]');
   if (close) close.addEventListener('click', () => openPanel('play'));

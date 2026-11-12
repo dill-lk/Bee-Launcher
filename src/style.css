@@ -595,3 +595,41 @@ body{font-size:15px}
   .patch-notes-list{grid-template-columns:1fr}
 }
 .sheet.big.skin-panel{overflow-y:auto}
+
+/* Keep windowed pages readable at the requested desktop scale, with one clear scroll area. */
+:root{--ui-scale:80%}
+@media(min-width:761px){
+  body{zoom:var(--ui-scale);width:125vw;height:125vh;overflow:hidden}
+  .sheet.big:not(.settings-panel){top:11%;bottom:15%;width:min(1150px,92%);height:auto;max-height:none;display:flex;flex-direction:column;overflow:hidden}
+  .sheet.big:not(.settings-panel)>.sh{flex:none;min-width:0;margin:0 0 12px}
+  .sheet.big:not(.settings-panel)>.sh>div{min-width:0}
+  .sheet.big:not(.settings-panel)>.sh h2{overflow-wrap:anywhere}
+  .panel-scroll{flex:1 1 auto;min-width:0;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 8px 10px 0;scrollbar-color:rgba(255,255,255,.28) transparent;scrollbar-width:thin;overflow-wrap:anywhere}
+  .panel-scroll::-webkit-scrollbar,.settings-pages::-webkit-scrollbar{width:8px}
+  .panel-scroll::-webkit-scrollbar-thumb,.settings-pages::-webkit-scrollbar-thumb{background:rgba(255,255,255,.28);border-radius:99px}
+  .panel-scroll .profile-list,.panel-scroll .custom-skin-grid{max-height:none;overflow:visible}
+  .panel-scroll .profile-list{padding-right:0}
+  .panel-scroll .item>div{min-width:0;flex:1}
+  .panel-scroll .item .go{flex:none;white-space:normal}
+  .panel-scroll :where(p,small,b,strong,span,li,code){overflow-wrap:anywhere;word-break:normal}
+  .panel-scroll .panel-actions{position:sticky;bottom:-10px;z-index:2;margin-top:10px;padding:13px 0 4px;background:linear-gradient(transparent,rgba(14,9,26,.96) 28%)}
+  .panel-scroll .btn,.panel-scroll .fld{max-width:100%;min-width:0;white-space:normal}
+  .settings-panel .settings-layout{min-width:0;overflow:hidden}
+  .settings-panel .settings-pages{min-width:0;overscroll-behavior:contain;overflow-x:hidden;overflow-y:auto;scrollbar-gutter:stable}
+  .settings-panel .settings-pages :where(p,small,b,strong,span,li,code){overflow-wrap:anywhere;word-break:normal}
+  .settings-panel .setting-row>div,.settings-panel .field-stack,.settings-panel .profile-setting{min-width:0}
+  .settings-panel .fld{min-width:0;max-width:100%}
+  .sheet.big.settings-panel{top:85px;width:min(1250px,95%);max-height:calc(100% - 105px)}
+}
+@media(min-width:761px) and (max-height:620px){
+  .sheet.big.settings-panel{top:65px;max-height:calc(100% - 80px)}
+  .settings-panel .sh{margin-bottom:7px;padding-bottom:8px}
+  .settings-panel .settings-footer{margin-top:4px;padding:7px 2px 8px}
+}
+@media(max-width:760px){
+  .sheet.big:not(.settings-panel){position:static;top:auto;right:auto;bottom:auto;left:auto;transform:none;width:auto;height:auto;max-height:none;margin:0 16px 20px;display:flex;flex-direction:column;overflow:visible}
+  .sheet.big:not(.settings-panel)>.panel-scroll{flex:none;min-height:0;overflow:visible;padding:0}
+  .sheet.big.settings-panel{position:static;top:auto;right:auto;bottom:auto;left:auto;transform:none;width:auto;max-width:none;height:auto;max-height:none;margin:0 16px 20px;padding:14px;overflow:visible;display:flex}
+  .settings-panel .settings-layout{flex:none;min-height:auto;overflow:visible}
+  .settings-panel .settings-pages{max-height:none;overflow:visible}
+}
