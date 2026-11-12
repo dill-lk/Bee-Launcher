@@ -55,6 +55,12 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.27', date: '2026-11-12', title: 'Windows proxy-aware News requests',
+    changes: [
+      'Enabled Windows system proxy and bypass settings for official Minecraft News requests.',
+    ],
+  },
+  {
     version: '0.1.26', date: '2026-11-12', title: 'Larger skin preview and resilient news',
     changes: [
       'Made the Play-screen 3D skin character larger without changing the viewer layout or saved skins.',

@@ -3643,6 +3643,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[ignore = "requires live access to minecraft.net"]
+    fn fetches_official_minecraft_news_over_the_live_rust_client() {
+        let articles = fetch_official_minecraft_news().expect("official News fetch should work");
+        assert!(!articles.is_empty(), "official News page should contain article cards");
+        assert!(articles.iter().all(|article| {
+            official_article_url(&article.url).as_deref() == Some(article.url.as_str())
+        }));
+    }
+
+    #[test]
     fn parses_official_minecraft_news_cards() {
         let html = concat!(
             r#"<section class="MC_tiledHeroA_card"><a href="/en-us/article/first"><h2>First announcement</h2><p>Details for the first.</p></a></section>"#,
