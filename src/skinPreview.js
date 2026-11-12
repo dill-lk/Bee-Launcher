@@ -85,7 +85,7 @@ export async function initializeSkinPreview(canvas, host, initialSkin = null) {
       pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
       model: 'auto-detect',
       fov: 42,
-      zoom: 0.76,
+      zoom: 1.0,
       enableControls: true,
       animation: idle,
       background: null,

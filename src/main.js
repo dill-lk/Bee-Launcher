@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.26', date: '2026-11-12', title: 'Larger skin preview and resilient news',
+    changes: [
+      'Made the Play-screen 3D skin character larger without changing the viewer layout or saved skins.',
+      'Improved the official News request and kept a separate last-successful-news cache for offline viewing.',
+    ],
+  },
+  {
     version: '0.1.25', date: '2026-11-12', title: 'Readable, scrollable windows',
     changes: [
       'Made Settings, Mods, Skins, Installations, News, and Patch Notes scroll cleanly without clipping long text or controls.',
@@ -683,9 +690,15 @@ async function loadMinecraftNews() {
   status.textContent = 'Fetching announcements from the official Minecraft website…';
   grid.innerHTML = '';
   try {
-    const articles = await invoke('fetch_minecraft_news');
+    const result = await invoke('fetch_minecraft_news');
+    const articles = result.articles;
     grid.innerHTML = articles.map((article) => `<article class="minecraft-news-card"><span class="news-card-source">MINECRAFT.NET · OFFICIAL</span><h3>${escapeHtml(article.title)}</h3><p>${escapeHtml(article.summary || 'Read the latest announcement from Mojang.')}</p><button class="btn news-read-link" data-news-url="${escapeHtml(article.url)}">Read article</button></article>`).join('');
-    status.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. News is fetched only when requested.`;
+    if (result.cached) {
+      const savedAt = new Date(result.fetchedAt * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+      status.textContent = `Live refresh failed; showing saved official news from ${savedAt}. ${result.error || ''}`;
+    } else {
+      status.textContent = `Updated ${new Date(result.fetchedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. News is fetched only when requested.`;
+    }
     grid.querySelectorAll('[data-news-url]').forEach((link) => link.addEventListener('click', async () => {
       try { await invoke('open_minecraft_news_link', { url: link.dataset.newsUrl }); }
       catch (error) { notify(`Could not open the official article: ${error}`, 7000); }

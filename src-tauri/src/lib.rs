@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::blocking::Client;
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -51,12 +52,28 @@ struct AppStatus {
     java_path: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MinecraftNewsArticle {
     title: String,
     summary: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedMinecraftNews {
+    articles: Vec<MinecraftNewsArticle>,
+    fetched_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftNewsResponse {
+    articles: Vec<MinecraftNewsArticle>,
+    cached: bool,
+    fetched_at: u64,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3301,17 +3318,162 @@ fn parse_minecraft_article_cards(html: &str) -> Vec<MinecraftNewsArticle> {
     articles
 }
 
-#[tauri::command]
-fn fetch_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
+fn minecraft_news_cache_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_cache_dir()
+        .ok()
+        .map(|directory| directory.join("minecraft-news.json"))
+}
+
+fn load_minecraft_news_cache(path: &Path) -> Option<CachedMinecraftNews> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let cache: CachedMinecraftNews = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if cache.articles.is_empty()
+        || cache.articles.iter().any(|article| {
+            official_article_url(&article.url).as_deref() != Some(article.url.as_str())
+        })
+    {
+        return None;
+    }
+    Some(cache)
+}
+
+fn save_minecraft_news_cache(path: &Path, cache: &CachedMinecraftNews) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not locate the news cache folder.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not prepare the news cache: {error}"))?;
+    let contents = serde_json::to_vec(cache)
+        .map_err(|error| format!("Could not encode the news cache: {error}"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_file_name(format!(
+        ".minecraft-news-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        replace_news_cache_file(&temporary, path)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not save the news cache: {error}"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_news_cache_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let temporary: Vec<u16> = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_news_cache_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+fn news_transport_error(error: &reqwest::Error) -> String {
+    let cause = if error.is_timeout() {
+        "the request timed out"
+    } else if error.is_connect() {
+        "the connection failed"
+    } else {
+        "the request failed"
+    };
+    format!(
+        "Could not reach the official Minecraft News page because {cause}. Check the internet connection, proxy settings, or firewall, then refresh. Details: {error}"
+    )
+}
+
+fn minecraft_news_request(client: &Client) -> reqwest::blocking::RequestBuilder {
+    client
+        .get("https://www.minecraft.net/en-us/article")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+}
+
+fn fetch_official_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(25))
         .user_agent(format!("BeeLauncher/{LAUNCHER_VERSION}"))
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many Minecraft News redirects")
+            } else if attempt.previous().iter().any(|url| url == attempt.url()) {
+                attempt.error("Minecraft News redirect loop blocked")
+            } else if attempt.url().scheme() != "https"
+                || !matches!(
+                    attempt.url().host_str(),
+                    Some("www.minecraft.net" | "minecraft.net")
+                )
+            {
+                attempt.error("redirect to a non-official Minecraft News host blocked")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|error| format!("Could not prepare the news request: {error}"))?;
-    let response = client
-        .get("https://www.minecraft.net/en-us/article")
-        .send()
-        .map_err(|error| format!("Could not reach the official Minecraft News page: {error}"))?;
+    let response = match minecraft_news_request(&client).send() {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => {
+            thread::sleep(Duration::from_millis(350));
+            minecraft_news_request(&client)
+                .send()
+                .map_err(|retry_error| news_transport_error(&retry_error))?
+        }
+        Err(error) => return Err(news_transport_error(&error)),
+    };
+    if response.url().scheme() != "https"
+        || !matches!(
+            response.url().host_str(),
+            Some("www.minecraft.net" | "minecraft.net")
+        )
+    {
+        return Err(
+            "Minecraft News redirected to an unexpected website; the response was blocked."
+                .to_string(),
+        );
+    }
     if !response.status().is_success() {
         return Err(format!(
             "The official Minecraft News page returned HTTP {}.",
@@ -3326,7 +3488,7 @@ fn fetch_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
     }
     let html = response
         .text()
-        .map_err(|error| format!("Could not read the official Minecraft News page: {error}"))?;
+        .map_err(|error| news_transport_error(&error))?;
     if html.len() > 5 * 1024 * 1024 {
         return Err("The official news page was larger than expected.".to_string());
     }
@@ -3335,6 +3497,43 @@ fn fetch_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
         return Err("The official news page format changed; open Minecraft.net to view the latest announcements.".to_string());
     }
     Ok(articles)
+}
+
+#[tauri::command]
+fn fetch_minecraft_news(app: AppHandle) -> Result<MinecraftNewsResponse, String> {
+    let cache_path = minecraft_news_cache_path(&app);
+    match fetch_official_minecraft_news() {
+        Ok(articles) => {
+            let fetched_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cache = CachedMinecraftNews {
+                articles: articles.clone(),
+                fetched_at,
+            };
+            if let Some(path) = cache_path.as_deref() {
+                let _ = save_minecraft_news_cache(path, &cache);
+            }
+            Ok(MinecraftNewsResponse {
+                articles,
+                cached: false,
+                fetched_at,
+                error: None,
+            })
+        }
+        Err(error) => {
+            if let Some(cache) = cache_path.as_deref().and_then(load_minecraft_news_cache) {
+                return Ok(MinecraftNewsResponse {
+                    articles: cache.articles,
+                    cached: true,
+                    fetched_at: cache.fetched_at,
+                    error: Some(error),
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -3442,6 +3641,59 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_official_minecraft_news_cards() {
+        let html = concat!(
+            r#"<section class="MC_tiledHeroA_card"><a href="/en-us/article/first"><h2>First announcement</h2><p>Details for the first.</p></a></section>"#,
+            r#"<section class="MC_tiledHeroA_card"><a href="https://www.minecraft.net/en-us/article/second"><h2>Second announcement</h2><p>Details for the second.</p></a></section>"#,
+        );
+
+        let articles = parse_minecraft_article_cards(html);
+        assert_eq!(articles.len(), 2);
+        assert_eq!(articles[0].title, "First announcement");
+        assert_eq!(articles[0].summary, "Details for the first.");
+        assert_eq!(
+            articles[0].url,
+            "https://www.minecraft.net/en-us/article/first"
+        );
+        assert_eq!(articles[1].title, "Second announcement");
+    }
+
+    #[test]
+    fn news_cache_roundtrips_and_rejects_non_minecraft_urls() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("minecraft-news-cache-test-{unique}"));
+        let path = directory.join("minecraft-news.json");
+        let cache = CachedMinecraftNews {
+            articles: vec![MinecraftNewsArticle {
+                title: "Official article".to_string(),
+                summary: "Cached summary".to_string(),
+                url: "https://www.minecraft.net/en-us/article/example".to_string(),
+            }],
+            fetched_at: 1_800_000_000,
+        };
+
+        save_minecraft_news_cache(&path, &cache).unwrap();
+        let loaded = load_minecraft_news_cache(&path).unwrap();
+        assert_eq!(loaded.fetched_at, cache.fetched_at);
+        assert_eq!(loaded.articles[0].url, cache.articles[0].url);
+
+        let tampered = CachedMinecraftNews {
+            articles: vec![MinecraftNewsArticle {
+                title: "Untrusted article".to_string(),
+                summary: String::new(),
+                url: "https://example.invalid/article".to_string(),
+            }],
+            fetched_at: cache.fetched_at,
+        };
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(load_minecraft_news_cache(&path).is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     fn seed_profile_libraries_for_host(game_dir: &Path, chain: &[(String, Value)]) {
         use std::io::Write;
