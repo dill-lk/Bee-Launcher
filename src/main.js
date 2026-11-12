@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.28', date: '2026-11-12', title: 'Reliable official Minecraft News',
+    changes: [
+      'Loads news from Minecraft.net’s first-party RSS feed instead of scraping the page layout.',
+      'Uses Windows system Internet settings for News requests and keeps manual refresh, official article links, and saved offline articles.',
+    ],
+  },
+  {
     version: '0.1.27', date: '2026-11-12', title: 'Windows proxy-aware News requests',
     changes: [
       'Enabled Windows system proxy and bypass settings for official Minecraft News requests.',

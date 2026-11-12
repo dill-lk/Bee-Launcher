@@ -7,7 +7,7 @@ A Windows-first Tauri launcher with a full-bleed Minecraft home screen, custom B
 - Redesigns Settings into Profile, Game, Appearance, Minecraft folder, and About pages. Profile-specific Java and memory overrides are supported, plus an optional reversible low-impact graphics preset; default game resolution, fullscreen, and memory stay separate.
 - Creates local world backups and lets you review the worlds and conflicts before restoring. When a restore would replace a world, Bee first creates an additional safety backup of the existing destination.
 - Explains the most recent local launch log with rule-based, plain-English guidance and a redacted excerpt.
-- Loads official Minecraft news only when requested, keeps a separate Bee Launcher release-notes page, and shows the last successfully fetched articles when temporarily offline.
+- Loads official Minecraft news only when requested from Minecraft.net's first-party RSS feed. On Windows it uses the system Internet settings (including configured proxy/PAC) rather than a separate launcher-only route, keeps a separate Bee Launcher release-notes page, and shows the last successfully fetched articles when temporarily offline.
 
 - Scores `%LOCALAPPDATA%\.minecraft`, `%APPDATA%\.minecraft`, and `%USERPROFILE%\.minecraft` by their actual contents. TLauncher markers such as `TlauncherProfiles.json`, `TLauncher.exe`, `.fabric`, populated `versions`, `libraries`, and `runtime` folders let the populated Roaming install win over an empty LocalAppData placeholder. Old automatic picks are re-evaluated; a folder chosen manually is kept.
 - Lets you choose a different `.minecraft` folder and remembers it in the app's own settings directory.

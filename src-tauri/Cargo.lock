@@ -182,11 +182,12 @@ dependencies = [
 
 [[package]]
 name = "blockline-launcher"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "base64 0.22.1",
  "md5",
  "png",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
@@ -2518,6 +2519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]

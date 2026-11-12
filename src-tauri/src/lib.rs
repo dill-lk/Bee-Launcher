@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use quick_xml::de::from_str as from_xml_str;
 use reqwest::blocking::Client;
+#[cfg(not(windows))]
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +60,27 @@ struct MinecraftNewsArticle {
     title: String,
     summary: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftRssFeed {
+    channel: MinecraftRssChannel,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftRssChannel {
+    #[serde(rename = "item", default)]
+    items: Vec<MinecraftRssItem>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MinecraftRssItem {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    link: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3237,24 +3260,6 @@ fn plain_article_text(markup: &str) -> String {
     decode_article_text(&output.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn html_attribute(tag: &str, name: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let needle = format!(" {name}={quote}");
-        if let Some(start) = tag.find(&needle).map(|index| index + needle.len()) {
-            let end = tag[start..].find(quote)? + start;
-            return Some(decode_article_text(&tag[start..end]));
-        }
-    }
-    None
-}
-
-fn article_tag_content(segment: &str, tag: &str) -> Option<String> {
-    let start = segment.find(&format!("<{tag}"))?;
-    let content_start = segment[start..].find('>')? + start + 1;
-    let end = segment[content_start..].find(&format!("</{tag}>"))? + content_start;
-    Some(plain_article_text(&segment[content_start..end]))
-}
-
 fn official_article_url(href: &str) -> Option<String> {
     if href.starts_with("/") && !href.starts_with("//") {
         Some(format!("https://www.minecraft.net{href}"))
@@ -3267,55 +3272,38 @@ fn official_article_url(href: &str) -> Option<String> {
     }
 }
 
-fn parse_minecraft_article_cards(html: &str) -> Vec<MinecraftNewsArticle> {
-    let marker = "MC_tiledHeroA_card";
-    let mut position = 0;
+fn parse_minecraft_news_feed(xml: &str) -> Result<Vec<MinecraftNewsArticle>, String> {
+    let feed: MinecraftRssFeed = from_xml_str(xml)
+        .map_err(|_| "The official Minecraft News feed format could not be read.".to_string())?;
     let mut articles = Vec::new();
-    while let Some(found) = html[position..].find(marker) {
-        let card_start = position + found;
-        let card_end = html[card_start + marker.len()..]
-            .find(marker)
-            .map(|next| card_start + marker.len() + next)
-            .unwrap_or(html.len());
-        let segment = &html[card_start..card_end];
-        position = card_start + marker.len();
-        let Some(title) = article_tag_content(segment, "h2") else {
+    for item in feed.channel.items {
+        let title = plain_article_text(&item.title);
+        let summary = plain_article_text(&item.description);
+        let Some(url) = official_article_url(item.link.trim()) else {
             continue;
         };
-        let summary = article_tag_content(segment, "p").unwrap_or_default();
-        let mut link_search = segment;
-        let mut url = None;
-        while let Some(anchor) = link_search.find("<a") {
-            let after = &link_search[anchor..];
-            let Some(tag_end) = after.find('>') else {
-                break;
-            };
-            let tag = &after[..=tag_end];
-            if let Some(href) =
-                html_attribute(tag, "href").and_then(|href| official_article_url(&href))
-            {
-                url = Some(href);
-                break;
-            }
-            link_search = &after[tag_end + 1..];
-        }
-        if let Some(url) = url {
-            if !articles
+        if title.is_empty()
+            || articles
                 .iter()
                 .any(|article: &MinecraftNewsArticle| article.url == url)
-            {
-                articles.push(MinecraftNewsArticle {
-                    title,
-                    summary,
-                    url,
-                });
-            }
+        {
+            continue;
         }
+        articles.push(MinecraftNewsArticle {
+            title,
+            summary,
+            url,
+        });
         if articles.len() >= 10 {
             break;
         }
     }
-    articles
+    if articles.is_empty() {
+        return Err(
+            "The official Minecraft News feed did not contain readable articles.".to_string(),
+        );
+    }
+    Ok(articles)
 }
 
 fn minecraft_news_cache_path(app: &AppHandle) -> Option<PathBuf> {
@@ -3407,39 +3395,46 @@ fn replace_news_cache_file(temporary: &Path, destination: &Path) -> io::Result<(
     fs::rename(temporary, destination)
 }
 
-fn news_transport_error(error: &reqwest::Error) -> String {
-    let cause = if error.is_timeout() {
-        "the request timed out"
-    } else if error.is_connect() {
-        "the connection failed"
-    } else {
-        "the request failed"
-    };
-    format!(
-        "Could not reach the official Minecraft News page because {cause}. Check the internet connection, proxy settings, or firewall, then refresh. Details: {error}"
-    )
+const MINECRAFT_NEWS_FEED_URL: &str = "https://www.minecraft.net/en-us/feeds/community-content/rss";
+const MAX_MINECRAFT_NEWS_BYTES: usize = 5 * 1024 * 1024;
+
+fn valid_minecraft_news_feed_url(url: &str) -> bool {
+    if url == MINECRAFT_NEWS_FEED_URL {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        return url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:");
+    }
+    #[cfg(not(test))]
+    false
 }
 
-fn minecraft_news_request(client: &Client) -> reqwest::blocking::RequestBuilder {
-    client
-        .get("https://www.minecraft.net/en-us/article")
-        .header(
-            reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+fn fetch_minecraft_news_feed(url: &str) -> Result<String, String> {
+    if !valid_minecraft_news_feed_url(url) {
+        return Err("Bee only requests the official Minecraft News feed.".to_string());
+    }
+    #[cfg(windows)]
+    let body = fetch_minecraft_news_feed_with_wininet(url)?;
+    #[cfg(not(windows))]
+    let body = fetch_minecraft_news_feed_with_reqwest(url)?;
+    if body.len() > MAX_MINECRAFT_NEWS_BYTES {
+        return Err("The official Minecraft News feed was larger than expected.".to_string());
+    }
+    Ok(body)
 }
 
-fn fetch_official_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
-    let client = reqwest::blocking::Client::builder()
+#[cfg(not(windows))]
+fn fetch_minecraft_news_feed_with_reqwest(url: &str) -> Result<String, String> {
+    let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(25))
+        .timeout(Duration::from_secs(20))
         .user_agent(format!("BeeLauncher/{LAUNCHER_VERSION}"))
         .redirect(Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
-                attempt.error("too many Minecraft News redirects")
+                attempt.error("too many official Minecraft News redirects")
             } else if attempt.previous().iter().any(|url| url == attempt.url()) {
-                attempt.error("Minecraft News redirect loop blocked")
+                attempt.error("official Minecraft News redirect loop blocked")
             } else if attempt.url().scheme() != "https"
                 || !matches!(
                     attempt.url().host_str(),
@@ -3452,51 +3447,214 @@ fn fetch_official_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> 
             }
         }))
         .build()
-        .map_err(|error| format!("Could not prepare the news request: {error}"))?;
-    let response = match minecraft_news_request(&client).send() {
-        Ok(response) => response,
-        Err(error) if error.is_connect() => {
-            thread::sleep(Duration::from_millis(350));
-            minecraft_news_request(&client)
-                .send()
-                .map_err(|retry_error| news_transport_error(&retry_error))?
-        }
-        Err(error) => return Err(news_transport_error(&error)),
-    };
-    if response.url().scheme() != "https"
-        || !matches!(
-            response.url().host_str(),
-            Some("www.minecraft.net" | "minecraft.net")
+        .map_err(|error| format!("Could not prepare the official news request: {error}"))?;
+    let response = client
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
         )
-    {
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .map_err(|error| news_transport_error(&error))?;
+    if !is_official_minecraft_news_response(response.url()) {
         return Err(
-            "Minecraft News redirected to an unexpected website; the response was blocked."
+            "Minecraft News redirected away from the official website; the response was blocked."
                 .to_string(),
         );
     }
     if !response.status().is_success() {
         return Err(format!(
-            "The official Minecraft News page returned HTTP {}.",
+            "The official Minecraft News feed returned HTTP {}.",
             response.status()
         ));
     }
     if response
         .content_length()
-        .is_some_and(|length| length > 5 * 1024 * 1024)
+        .is_some_and(|length| length as usize > MAX_MINECRAFT_NEWS_BYTES)
     {
-        return Err("The official news page was larger than expected.".to_string());
+        return Err("The official Minecraft News feed was larger than expected.".to_string());
     }
-    let html = response
+    response
         .text()
-        .map_err(|error| news_transport_error(&error))?;
-    if html.len() > 5 * 1024 * 1024 {
-        return Err("The official news page was larger than expected.".to_string());
+        .map_err(|error| news_transport_error(&error))
+}
+
+#[cfg(not(windows))]
+fn is_official_minecraft_news_response(url: &reqwest::Url) -> bool {
+    if url.scheme() == "https"
+        && matches!(url.host_str(), Some("www.minecraft.net" | "minecraft.net"))
+    {
+        return true;
     }
-    let articles = parse_minecraft_article_cards(&html);
-    if articles.is_empty() {
-        return Err("The official news page format changed; open Minecraft.net to view the latest announcements.".to_string());
+    #[cfg(test)]
+    {
+        return url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
     }
-    Ok(articles)
+    #[cfg(not(test))]
+    false
+}
+
+#[cfg(not(windows))]
+fn news_transport_error(error: &reqwest::Error) -> String {
+    let cause = if error.is_timeout() {
+        "the request timed out"
+    } else if error.is_connect() {
+        "the connection failed"
+    } else {
+        "the request failed"
+    };
+    format!(
+        "Bee could not retrieve the official Minecraft News feed because {cause}. Details: {error}"
+    )
+}
+
+#[cfg(windows)]
+fn fetch_minecraft_news_feed_with_wininet(url: &str) -> Result<String, String> {
+    use std::{ffi::c_void, mem::size_of, ptr::null};
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        Networking::WinInet::{
+            HttpQueryInfoW, InternetCloseHandle, InternetOpenUrlW, InternetOpenW, InternetReadFile,
+            InternetSetOptionW, HTTP_QUERY_FLAG_NUMBER, HTTP_QUERY_STATUS_CODE,
+            INTERNET_FLAG_NO_AUTO_REDIRECT, INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_NO_UI,
+            INTERNET_FLAG_RELOAD, INTERNET_FLAG_SECURE, INTERNET_OPEN_TYPE_PRECONFIG,
+            INTERNET_OPTION_CONNECT_TIMEOUT, INTERNET_OPTION_RECEIVE_TIMEOUT,
+        },
+    };
+
+    struct Handle(*mut c_void);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                InternetCloseHandle(self.0);
+            }
+        }
+    }
+    fn wininet_error(stage: &str) -> String {
+        let code = unsafe { GetLastError() };
+        format!("Bee could not retrieve the official Minecraft News feed ({stage}; Windows error {code}).")
+    }
+
+    let agent: Vec<u16> = format!("BeeLauncher/{LAUNCHER_VERSION}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+    let headers: Vec<u16> = "Accept: application/rss+xml, application/xml;q=0.9, text/xml;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\n".encode_utf16().chain(Some(0)).collect();
+    let session = unsafe {
+        InternetOpenW(
+            agent.as_ptr(),
+            INTERNET_OPEN_TYPE_PRECONFIG,
+            null(),
+            null(),
+            0,
+        )
+    };
+    if session.is_null() {
+        return Err(wininet_error("opening Windows Internet settings"));
+    }
+    let session = Handle(session);
+    for (option, milliseconds) in [
+        (INTERNET_OPTION_CONNECT_TIMEOUT, 10_000u32),
+        (INTERNET_OPTION_RECEIVE_TIMEOUT, 20_000u32),
+    ] {
+        let applied = unsafe {
+            InternetSetOptionW(
+                session.0,
+                option,
+                &milliseconds as *const _ as *const c_void,
+                size_of::<u32>() as u32,
+            )
+        };
+        if applied == 0 {
+            return Err(wininet_error("setting a bounded network timeout"));
+        }
+    }
+    let security_flag = if url.starts_with("https://") {
+        INTERNET_FLAG_SECURE
+    } else {
+        0
+    };
+    let request = unsafe {
+        InternetOpenUrlW(
+            session.0,
+            url_wide.as_ptr(),
+            headers.as_ptr(),
+            headers.len().saturating_sub(1) as u32,
+            INTERNET_FLAG_RELOAD
+                | INTERNET_FLAG_NO_CACHE_WRITE
+                | INTERNET_FLAG_NO_UI
+                | INTERNET_FLAG_NO_AUTO_REDIRECT
+                | security_flag,
+            0,
+        )
+    };
+    if request.is_null() {
+        return Err(wininet_error("opening the official feed URL"));
+    }
+    let request = Handle(request);
+    let mut status = 0u32;
+    let mut status_len = size_of::<u32>() as u32;
+    let mut index = 0u32;
+    let status_read = unsafe {
+        HttpQueryInfoW(
+            request.0,
+            HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+            &mut status as *mut _ as *mut c_void,
+            &mut status_len,
+            &mut index,
+        )
+    };
+    if status_read == 0 {
+        return Err(wininet_error("reading the official feed response status"));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "The official Minecraft News feed returned HTTP {status}."
+        ));
+    }
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let mut bytes_read = 0u32;
+        let read_ok = unsafe {
+            InternetReadFile(
+                request.0,
+                chunk.as_mut_ptr() as *mut c_void,
+                chunk.len() as u32,
+                &mut bytes_read,
+            )
+        };
+        if read_ok == 0 {
+            return Err(wininet_error("reading the official feed body"));
+        }
+        if bytes_read == 0 {
+            break;
+        }
+        if output.len().saturating_add(bytes_read as usize) > MAX_MINECRAFT_NEWS_BYTES {
+            return Err("The official Minecraft News feed was larger than expected.".to_string());
+        }
+        output.extend_from_slice(&chunk[..bytes_read as usize]);
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+#[cfg(windows)]
+fn fetch_official_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
+    let xml = fetch_minecraft_news_feed(MINECRAFT_NEWS_FEED_URL)?;
+    parse_minecraft_news_feed(&xml)
+}
+
+#[cfg(not(windows))]
+fn fetch_official_minecraft_news() -> Result<Vec<MinecraftNewsArticle>, String> {
+    fetch_minecraft_news_from_url(MINECRAFT_NEWS_FEED_URL)
+}
+
+#[cfg(any(not(windows), test))]
+fn fetch_minecraft_news_from_url(url: &str) -> Result<Vec<MinecraftNewsArticle>, String> {
+    let xml = fetch_minecraft_news_feed(url)?;
+    parse_minecraft_news_feed(&xml)
 }
 
 #[tauri::command]
@@ -3643,31 +3801,59 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    #[ignore = "requires live access to minecraft.net"]
+    #[ignore = "requires direct live access to minecraft.net"]
     fn fetches_official_minecraft_news_over_the_live_rust_client() {
         let articles = fetch_official_minecraft_news().expect("official News fetch should work");
-        assert!(!articles.is_empty(), "official News page should contain article cards");
+        assert!(
+            !articles.is_empty(),
+            "official Minecraft RSS feed should contain articles"
+        );
         assert!(articles.iter().all(|article| {
             official_article_url(&article.url).as_deref() == Some(article.url.as_str())
         }));
     }
 
     #[test]
-    fn parses_official_minecraft_news_cards() {
-        let html = concat!(
-            r#"<section class="MC_tiledHeroA_card"><a href="/en-us/article/first"><h2>First announcement</h2><p>Details for the first.</p></a></section>"#,
-            r#"<section class="MC_tiledHeroA_card"><a href="https://www.minecraft.net/en-us/article/second"><h2>Second announcement</h2><p>Details for the second.</p></a></section>"#,
-        );
+    fn fetches_and_parses_official_rss_articles_over_the_rust_http_path() {
+        use std::net::TcpListener;
 
-        let articles = parse_minecraft_article_cards(html);
+        let body = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Minecraft</title>"#,
+            r#"<item><title>Marketplace Spotlight: The Sound Effects Edition</title><link>https://www.minecraft.net/en-us/article/marketplace-spotlight-sound-effects</link><description><![CDATA[<p>Discover seven new sound effect packs on Minecraft Marketplace, from retro arcade beats to spooky soundscapes and relaxing audio for your adventures.</p>]]></description></item>"#,
+            r#"<item><title>New watch time challenge</title><link>https://www.minecraft.net/en-us/article/twitchcon-watch-time-quest</link><description><![CDATA[<p>Join the fun and earn a free add-on!</p>]]></description></item>"#,
+            r#"<item><title>Untrusted item</title><link>https://example.invalid/fake</link><description>Must be discarded</description></item>"#,
+            r#"</channel></rss>"#,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let articles = fetch_minecraft_news_from_url(&format!("http://{address}/rss"))
+            .expect("Rust news transport should fetch and parse the RSS response");
+        server.join().unwrap();
         assert_eq!(articles.len(), 2);
-        assert_eq!(articles[0].title, "First announcement");
-        assert_eq!(articles[0].summary, "Details for the first.");
+        assert_eq!(
+            articles[0].title,
+            "Marketplace Spotlight: The Sound Effects Edition"
+        );
+        assert!(articles[0].summary.contains("seven new sound effect packs"));
         assert_eq!(
             articles[0].url,
-            "https://www.minecraft.net/en-us/article/first"
+            "https://www.minecraft.net/en-us/article/marketplace-spotlight-sound-effects"
         );
-        assert_eq!(articles[1].title, "Second announcement");
+        assert_eq!(articles[1].title, "New watch time challenge");
+        assert_eq!(articles[1].summary, "Join the fun and earn a free add-on!");
     }
 
     #[test]
