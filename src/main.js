@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.30', date: '2026-11-12', title: 'Explicit Windows proxy handling for News',
+    changes: [
+      'Uses Windows WinHTTP to resolve the current user’s PAC/WPAD or static proxy and bypass rules for each official Minecraft News URL.',
+      'Keeps the official page/RSS fallback, bounded request timeouts, manual refresh, and saved offline articles.',
+    ],
+  },
+  {
     version: '0.1.29', date: '2026-11-12', title: 'More reliable official Minecraft News',
     changes: [
       'Loads article cards from Minecraft.net’s official News page first, with its RSS feed as a fallback.',

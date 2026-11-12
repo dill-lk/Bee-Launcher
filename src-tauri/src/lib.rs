@@ -3603,7 +3603,7 @@ fn fetch_minecraft_news_body(url: &str) -> Result<String, String> {
         return Err("Bee only requests the official Minecraft News page or feed.".to_string());
     }
     #[cfg(windows)]
-    let body = fetch_minecraft_news_body_with_wininet(url)?;
+    let body = fetch_minecraft_news_body_with_winhttp(url)?;
     #[cfg(not(windows))]
     let body = fetch_minecraft_news_body_with_reqwest(url)?;
     if body.len() > MAX_MINECRAFT_NEWS_BYTES {
@@ -3698,125 +3698,418 @@ fn news_transport_error(error: &reqwest::Error) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MinecraftNewsProxyStrategy {
+    Automatic { pac_url: bool, wpad: bool },
+    Static,
+    Direct,
+}
+
+fn minecraft_news_proxy_strategy(
+    has_pac_url: bool,
+    auto_detect: bool,
+    has_static_proxy: bool,
+) -> MinecraftNewsProxyStrategy {
+    if has_pac_url || auto_detect {
+        MinecraftNewsProxyStrategy::Automatic {
+            pac_url: has_pac_url,
+            wpad: auto_detect,
+        }
+    } else if has_static_proxy {
+        MinecraftNewsProxyStrategy::Static
+    } else {
+        MinecraftNewsProxyStrategy::Direct
+    }
+}
+
 #[cfg(windows)]
-fn fetch_minecraft_news_body_with_wininet(url: &str) -> Result<Vec<u8>, String> {
-    use std::{ffi::c_void, mem::size_of, ptr::null};
+fn fetch_minecraft_news_body_with_winhttp(url: &str) -> Result<Vec<u8>, String> {
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        ptr::{null, null_mut},
+    };
     use windows_sys::Win32::{
-        Foundation::GetLastError,
-        Networking::WinInet::{
-            HttpQueryInfoW, InternetCloseHandle, InternetOpenUrlW, InternetOpenW, InternetReadFile,
-            InternetSetOptionW, HTTP_QUERY_FLAG_NUMBER, HTTP_QUERY_STATUS_CODE,
-            INTERNET_FLAG_NO_AUTO_REDIRECT, INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_NO_UI,
-            INTERNET_FLAG_RELOAD, INTERNET_FLAG_SECURE, INTERNET_OPEN_TYPE_PRECONFIG,
-            INTERNET_OPTION_CONNECT_TIMEOUT, INTERNET_OPTION_RECEIVE_TIMEOUT,
+        Foundation::{GetLastError, GlobalFree, ERROR_FILE_NOT_FOUND},
+        Networking::WinHttp::{
+            WinHttpCloseHandle, WinHttpConnect, WinHttpGetIEProxyConfigForCurrentUser,
+            WinHttpGetProxyForUrl, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+            WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+            WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_AUTOPROXY_AUTO_DETECT,
+            WINHTTP_AUTOPROXY_CONFIG_URL, WINHTTP_AUTOPROXY_OPTIONS, WINHTTP_AUTO_DETECT_TYPE_DHCP,
+            WINHTTP_AUTO_DETECT_TYPE_DNS_A, WINHTTP_CURRENT_USER_IE_PROXY_CONFIG,
+            WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY,
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_PROXY_INFO, WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_QUERY_STATUS_CODE,
         },
     };
 
     struct Handle(*mut c_void);
     impl Drop for Handle {
         fn drop(&mut self) {
+            unsafe { WinHttpCloseHandle(self.0) };
+        }
+    }
+
+    struct CurrentUserProxyConfig(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG);
+    impl Drop for CurrentUserProxyConfig {
+        fn drop(&mut self) {
             unsafe {
-                InternetCloseHandle(self.0);
+                for value in [
+                    self.0.lpszAutoConfigUrl,
+                    self.0.lpszProxy,
+                    self.0.lpszProxyBypass,
+                ] {
+                    if !value.is_null() {
+                        GlobalFree(value.cast());
+                    }
+                }
             }
         }
     }
-    fn wininet_error(stage: &str) -> String {
-        let code = unsafe { GetLastError() };
-        format!("Bee could not retrieve the official Minecraft News source ({stage}; Windows error {code}).")
+
+    struct ResolvedProxyInfo(WINHTTP_PROXY_INFO);
+    impl Drop for ResolvedProxyInfo {
+        fn drop(&mut self) {
+            unsafe {
+                for value in [self.0.lpszProxy, self.0.lpszProxyBypass] {
+                    if !value.is_null() {
+                        GlobalFree(value.cast());
+                    }
+                }
+            }
+        }
     }
 
+    struct ProxySettings {
+        access_type: u32,
+        proxy: Vec<u16>,
+        bypass: Vec<u16>,
+    }
+    impl ProxySettings {
+        fn direct() -> Self {
+            Self {
+                access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
+                proxy: vec![0],
+                bypass: vec![0],
+            }
+        }
+
+        fn named(proxy: &str, bypass: Option<&str>) -> Self {
+            Self {
+                access_type: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                proxy: proxy.encode_utf16().chain(Some(0)).collect(),
+                bypass: bypass.unwrap_or("").encode_utf16().chain(Some(0)).collect(),
+            }
+        }
+
+        fn from_resolved(info: &WINHTTP_PROXY_INFO) -> Result<Self, String> {
+            match info.dwAccessType {
+                WINHTTP_ACCESS_TYPE_NO_PROXY => Ok(Self::direct()),
+                WINHTTP_ACCESS_TYPE_NAMED_PROXY => {
+                    let proxy = unsafe { wide_ptr_to_string(info.lpszProxy) }
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| {
+                            "Windows resolved an automatic proxy without a proxy address."
+                                .to_string()
+                        })?;
+                    let bypass = unsafe { wide_ptr_to_string(info.lpszProxyBypass) };
+                    Ok(Self::named(&proxy, bypass.as_deref()))
+                }
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY => Ok(Self {
+                    access_type: WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                    proxy: vec![0],
+                    bypass: vec![0],
+                }),
+                other => Err(format!(
+                    "Windows returned an unsupported proxy mode ({other})."
+                )),
+            }
+        }
+    }
+
+    unsafe fn wide_ptr_to_string(value: *const u16) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut length = 0usize;
+        while *value.add(length) != 0 {
+            length += 1;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+            value, length,
+        )))
+    }
+
+    fn winhttp_error(stage: &str, code: u32) -> String {
+        format!(
+            "Bee could not retrieve the official Minecraft News source ({stage}; Windows error {code})."
+        )
+    }
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| format!("The official Minecraft News URL was invalid: {error}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "The official Minecraft News URL has no host.".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "The official Minecraft News URL has no network port.".to_string())?;
+    let mut path = parsed.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
     let agent: Vec<u16> = format!("BeeLauncher/{LAUNCHER_VERSION}")
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
-    let headers: Vec<u16> = "Accept: text/html, application/xhtml+xml, application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5\r\nAccept-Language: en-US,en;q=0.9\r\n".encode_utf16().chain(Some(0)).collect();
-    let session = unsafe {
-        InternetOpenW(
+    let host_wide: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
+    let path_wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let method: Vec<u16> = "GET".encode_utf16().chain(Some(0)).collect();
+    let headers: Vec<u16> = "Accept: text/html, application/xhtml+xml, application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5\r\nAccept-Language: en-US,en;q=0.9\r\n"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let accept: Vec<u16> = "*/*".encode_utf16().chain(Some(0)).collect();
+    let accept_types = [accept.as_ptr(), null()];
+    let discovery = unsafe {
+        WinHttpOpen(
             agent.as_ptr(),
-            INTERNET_OPEN_TYPE_PRECONFIG,
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
             null(),
             null(),
+            0,
+        )
+    };
+    if discovery.is_null() {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error("opening Windows HTTP proxy discovery", error));
+    }
+    let discovery = Handle(discovery);
+    if unsafe { WinHttpSetTimeouts(discovery.0, 10_000, 10_000, 10_000, 20_000) } == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "setting bounded proxy-discovery timeouts",
+            error,
+        ));
+    }
+
+    let mut current_user_config =
+        CurrentUserProxyConfig(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default());
+    let config_found = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut current_user_config.0) };
+    let proxy_settings = if config_found != 0 {
+        let auto_url: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let proxy = unsafe { wide_ptr_to_string(current_user_config.0.lpszProxy) }
+            .filter(|value| !value.trim().is_empty());
+        let has_pac_url = !current_user_config.0.lpszAutoConfigUrl.is_null();
+        match minecraft_news_proxy_strategy(
+            has_pac_url,
+            current_user_config.0.fAutoDetect != 0,
+            proxy.is_some(),
+        ) {
+            MinecraftNewsProxyStrategy::Automatic { pac_url, wpad } => {
+                let mut options = WINHTTP_AUTOPROXY_OPTIONS::default();
+                if pac_url {
+                    options.dwFlags |= WINHTTP_AUTOPROXY_CONFIG_URL;
+                    options.lpszAutoConfigUrl = current_user_config.0.lpszAutoConfigUrl;
+                }
+                if wpad {
+                    options.dwFlags |= WINHTTP_AUTOPROXY_AUTO_DETECT;
+                    options.dwAutoDetectFlags =
+                        WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
+                }
+                options.fAutoLogonIfChallenged = 0;
+                let mut resolved = ResolvedProxyInfo(WINHTTP_PROXY_INFO::default());
+                let succeeded = unsafe {
+                    WinHttpGetProxyForUrl(
+                        discovery.0,
+                        auto_url.as_ptr(),
+                        &mut options,
+                        &mut resolved.0,
+                    )
+                };
+                if succeeded != 0 {
+                    ProxySettings::from_resolved(&resolved.0)?
+                } else {
+                    let error = unsafe { GetLastError() };
+                    if let Some(proxy) = proxy {
+                        let bypass =
+                            unsafe { wide_ptr_to_string(current_user_config.0.lpszProxyBypass) };
+                        ProxySettings::named(&proxy, bypass.as_deref())
+                    } else {
+                        return Err(format!(
+                            "Windows automatic proxy discovery failed (Windows error {error})."
+                        ));
+                    }
+                }
+            }
+            MinecraftNewsProxyStrategy::Static => {
+                let bypass = unsafe { wide_ptr_to_string(current_user_config.0.lpszProxyBypass) };
+                ProxySettings::named(proxy.as_deref().unwrap_or_default(), bypass.as_deref())
+            }
+            MinecraftNewsProxyStrategy::Direct => ProxySettings::direct(),
+        }
+    } else {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_FILE_NOT_FOUND {
+            ProxySettings::direct()
+        } else {
+            return Err(winhttp_error(
+                "reading the current user's Windows proxy settings",
+                error,
+            ));
+        }
+    };
+    drop(current_user_config);
+    drop(discovery);
+
+    let proxy_ptr = if proxy_settings.proxy.len() > 1 {
+        proxy_settings.proxy.as_ptr()
+    } else {
+        null()
+    };
+    let bypass_ptr = if proxy_settings.bypass.len() > 1 {
+        proxy_settings.bypass.as_ptr()
+    } else {
+        null()
+    };
+    let session = unsafe {
+        WinHttpOpen(
+            agent.as_ptr(),
+            proxy_settings.access_type,
+            proxy_ptr,
+            bypass_ptr,
             0,
         )
     };
     if session.is_null() {
-        return Err(wininet_error("opening Windows Internet settings"));
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error("opening the Windows HTTP session", error));
     }
     let session = Handle(session);
-    for (option, milliseconds) in [
-        (INTERNET_OPTION_CONNECT_TIMEOUT, 10_000u32),
-        (INTERNET_OPTION_RECEIVE_TIMEOUT, 20_000u32),
-    ] {
-        let applied = unsafe {
-            InternetSetOptionW(
-                session.0,
-                option,
-                &milliseconds as *const _ as *const c_void,
-                size_of::<u32>() as u32,
-            )
-        };
-        if applied == 0 {
-            return Err(wininet_error("setting a bounded network timeout"));
-        }
+    if unsafe { WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 20_000) } == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error("setting bounded request timeouts", error));
     }
-    let security_flag = if url.starts_with("https://") {
-        INTERNET_FLAG_SECURE
+    let connection = unsafe { WinHttpConnect(session.0, host_wide.as_ptr(), port, 0) };
+    if connection.is_null() {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "connecting to the official Minecraft host",
+            error,
+        ));
+    }
+    let connection = Handle(connection);
+    let request_flags = if parsed.scheme() == "https" {
+        WINHTTP_FLAG_SECURE
     } else {
         0
     };
     let request = unsafe {
-        InternetOpenUrlW(
-            session.0,
-            url_wide.as_ptr(),
-            headers.as_ptr(),
-            headers.len().saturating_sub(1) as u32,
-            INTERNET_FLAG_RELOAD
-                | INTERNET_FLAG_NO_CACHE_WRITE
-                | INTERNET_FLAG_NO_UI
-                | INTERNET_FLAG_NO_AUTO_REDIRECT
-                | security_flag,
-            0,
+        WinHttpOpenRequest(
+            connection.0,
+            method.as_ptr(),
+            path_wide.as_ptr(),
+            null(),
+            null(),
+            accept_types.as_ptr(),
+            request_flags,
         )
     };
     if request.is_null() {
-        return Err(wininet_error("opening the official Minecraft URL"));
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "opening the official Minecraft request",
+            error,
+        ));
     }
     let request = Handle(request);
+    let redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if unsafe {
+        WinHttpSetOption(
+            request.0,
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            &redirect_policy as *const _ as *const c_void,
+            size_of::<u32>() as u32,
+        )
+    } == 0
+    {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "enforcing the official-host redirect policy",
+            error,
+        ));
+    }
+    if unsafe {
+        WinHttpSendRequest(
+            request.0,
+            headers.as_ptr(),
+            headers.len().saturating_sub(1) as u32,
+            null(),
+            0,
+            0,
+            0,
+        )
+    } == 0
+    {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "sending the official Minecraft request",
+            error,
+        ));
+    }
+    if unsafe { WinHttpReceiveResponse(request.0, null_mut()) } == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error(
+            "receiving the official Minecraft response",
+            error,
+        ));
+    }
     let mut status = 0u32;
     let mut status_len = size_of::<u32>() as u32;
     let mut index = 0u32;
     let status_read = unsafe {
-        HttpQueryInfoW(
+        WinHttpQueryHeaders(
             request.0,
-            HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            null(),
             &mut status as *mut _ as *mut c_void,
             &mut status_len,
             &mut index,
         )
     };
     if status_read == 0 {
-        return Err(wininet_error("reading the official feed response status"));
+        let error = unsafe { GetLastError() };
+        return Err(winhttp_error("reading the official response status", error));
     }
     if !(200..300).contains(&status) {
         return Err(format!(
-            "The official Minecraft News source returned HTTP {status}."
+            "The official Minecraft News source returned HTTP {status}; redirects are not followed."
         ));
     }
     let mut output = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
         let mut bytes_read = 0u32;
-        let read_ok = unsafe {
-            InternetReadFile(
+        if unsafe {
+            WinHttpReadData(
                 request.0,
                 chunk.as_mut_ptr() as *mut c_void,
                 chunk.len() as u32,
                 &mut bytes_read,
             )
-        };
-        if read_ok == 0 {
-            return Err(wininet_error("reading the official feed body"));
+        } == 0
+        {
+            let error = unsafe { GetLastError() };
+            return Err(winhttp_error(
+                "reading the official Minecraft response body",
+                error,
+            ));
         }
         if bytes_read == 0 {
             break;
@@ -4001,6 +4294,36 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn news_proxy_strategy_prefers_per_url_automatic_resolution() {
+        assert_eq!(
+            minecraft_news_proxy_strategy(true, true, true),
+            MinecraftNewsProxyStrategy::Automatic {
+                pac_url: true,
+                wpad: true,
+            }
+        );
+        assert_eq!(
+            minecraft_news_proxy_strategy(false, true, false),
+            MinecraftNewsProxyStrategy::Automatic {
+                pac_url: false,
+                wpad: true,
+            }
+        );
+    }
+
+    #[test]
+    fn news_proxy_strategy_uses_static_proxy_or_direct_when_no_auto_config_exists() {
+        assert_eq!(
+            minecraft_news_proxy_strategy(false, false, true),
+            MinecraftNewsProxyStrategy::Static
+        );
+        assert_eq!(
+            minecraft_news_proxy_strategy(false, false, false),
+            MinecraftNewsProxyStrategy::Direct
+        );
+    }
 
     #[test]
     #[ignore = "requires direct live access to minecraft.net"]
