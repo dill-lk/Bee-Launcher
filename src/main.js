@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.31', date: '2026-11-12', title: 'Forge, NeoForge, and Quilt modpack imports',
+    changes: [
+      'Imports Modrinth format-v1 vanilla, Fabric, Quilt, Forge, and NeoForge packs as isolated profiles; Forge and NeoForge use their official client installers inside the new pack folder.',
+      'Bee ZIP imports remain offline and reuse a matching Minecraft/loader profile already installed locally; CurseForge ZIP archives, future/custom loader dependencies, and packs pinning multiple loaders are not supported.',
+    ],
+  },
+  {
     version: '0.1.30', date: '2026-11-12', title: 'Explicit Windows proxy handling for News',
     changes: [
       'Uses Windows WinHTTP to resolve the current user’s PAC/WPAD or static proxy and bypass rules for each official Minecraft News URL.',
@@ -664,10 +671,10 @@ function openPanel(name, title = '') {
     sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or Bee Launcher ZIP')}
       <div class="panel-scroll">
       <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>The pack gets its own game folder. Your existing .minecraft mods, configs, and saves stay untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose .mrpack or ZIP</button>
-        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">ZIPs reuse installed Minecraft files; .mrpacks may download missing files.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
+        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">Modrinth packs may download game files and loader components; Bee ZIPs reuse files already installed locally.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>Fabric and vanilla Modrinth packs are supported; Forge, NeoForge, and Quilt are not supported yet. Imported mod files are checked against their manifest hashes.</span></div>
+      <div class="local-note"><span class="note-mark">i</span><span>Modrinth format-v1 packs with vanilla, Fabric, Quilt, Forge, or NeoForge are supported. Forge/NeoForge installs need internet and a compatible Java runtime. Bee ZIPs work offline only when the matching Minecraft/loader profile is already installed and the ZIP contains every client mod. CurseForge ZIP archives, future/custom loader IDs, other archive formats, and packs pinning multiple loaders are not supported. Imported mod files are checked against their manifest hashes.</span></div>
       <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>
       </div>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);
@@ -1111,7 +1118,7 @@ async function installModpack(path) {
     appStatus = await invoke('app_status');
     renderStatus();
     if (progressTitle) progressTitle.textContent = 'Modpack installed';
-    if (progressMessage) progressMessage.textContent = `${result.instanceName} · Minecraft ${result.minecraftVersion}${result.fabricLoader ? ` · Fabric ${result.fabricLoader}` : ''}`;
+    if (progressMessage) progressMessage.textContent = `${result.instanceName} · Minecraft ${result.minecraftVersion}${result.loaderName ? ` · ${result.loaderName} ${result.loaderVersion}` : ' · Vanilla'}`;
     if (progressBar) progressBar.value = 100;
     if (progressDetail) progressDetail.textContent = `${result.filesInstalled} mod files verified`;
     notify(`${result.instanceName} imported as a separate profile.`, 7500);

@@ -61,12 +61,52 @@ struct ModrinthEnvironment {
     client: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderKind {
+    Fabric,
+    Quilt,
+    Forge,
+    NeoForge,
+}
+
+impl LoaderKind {
+    fn dependency_key(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric-loader",
+            Self::Quilt => "quilt-loader",
+            Self::Forge => "forge",
+            Self::NeoForge => "neoforge",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fabric => "Fabric",
+            Self::Quilt => "Quilt",
+            Self::Forge => "Forge",
+            Self::NeoForge => "NeoForge",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderPin {
+    kind: LoaderKind,
+    version: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstanceMarker {
     instance_id: String,
     name: String,
     minecraft_version: String,
+    #[serde(default)]
+    loader_name: Option<String>,
+    #[serde(default)]
+    loader_version: Option<String>,
+    // Retained so markers created by older releases remain readable.
+    #[serde(default)]
     fabric_loader: Option<String>,
     profile_id: String,
     pack_version: Option<String>,
@@ -78,7 +118,8 @@ pub(super) struct ImportResult {
     instance_name: String,
     profile_key: String,
     minecraft_version: String,
-    fabric_loader: Option<String>,
+    loader_name: Option<String>,
+    loader_version: Option<String>,
     files_installed: usize,
 }
 
@@ -169,7 +210,7 @@ fn validate_dependency_version(value: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_manifest(manifest: &ModrinthManifest) -> Result<(String, Option<String>), String> {
+fn validate_manifest(manifest: &ModrinthManifest) -> Result<(String, Option<LoaderPin>), String> {
     if manifest.format_version != 1 {
         return Err(format!(
             "This Modrinth pack uses format version {}; Bee Launcher supports format version 1.",
@@ -187,17 +228,45 @@ fn validate_manifest(manifest: &ModrinthManifest) -> Result<(String, Option<Stri
         .get("minecraft")
         .ok_or_else(|| "The modpack does not pin a Minecraft version.".to_string())?;
     validate_dependency_version(minecraft, "Minecraft")?;
-    for unsupported in ["quilt-loader", "forge", "neoforge"] {
-        if manifest.dependencies.contains_key(unsupported) {
+    let supported_loaders = [
+        ("fabric-loader", LoaderKind::Fabric),
+        ("quilt-loader", LoaderKind::Quilt),
+        ("forge", LoaderKind::Forge),
+        ("neoforge", LoaderKind::NeoForge),
+    ];
+    let selected: Vec<(&str, LoaderKind, &String)> = supported_loaders
+        .iter()
+        .filter_map(|(key, kind)| {
+            manifest
+                .dependencies
+                .get(*key)
+                .map(|version| (*key, *kind, version))
+        })
+        .collect();
+    if selected.len() > 1 {
+        return Err("This modpack pins more than one mod loader; Bee Launcher can import only one loader per profile.".to_string());
+    }
+    for dependency in manifest.dependencies.keys() {
+        if dependency != "minecraft"
+            && !supported_loaders
+                .iter()
+                .any(|(supported, _)| dependency == supported)
+        {
             return Err(format!(
-                "This pack uses {unsupported}; this Bee Launcher build currently imports Fabric or vanilla Modrinth packs."
+                "This pack pins the unsupported {dependency} dependency; Bee Launcher supports vanilla, Fabric, Quilt, Forge, and NeoForge packs."
             ));
         }
     }
-    let fabric = manifest.dependencies.get("fabric-loader").cloned();
-    if let Some(loader) = fabric.as_deref() {
-        validate_dependency_version(loader, "Fabric Loader")?;
-    }
+    let loader = selected
+        .first()
+        .map(|(_, kind, version)| {
+            validate_dependency_version(version, kind.label())?;
+            Ok::<LoaderPin, String>(LoaderPin {
+                kind: *kind,
+                version: (*version).clone(),
+            })
+        })
+        .transpose()?;
     if manifest.files.len() > MAX_PACK_FILES {
         return Err("This modpack contains too many files to import safely.".to_string());
     }
@@ -250,7 +319,7 @@ fn validate_manifest(manifest: &ModrinthManifest) -> Result<(String, Option<Stri
             ));
         }
     }
-    Ok((minecraft.clone(), fabric))
+    Ok((minecraft.clone(), loader))
 }
 
 fn read_manifest(path: &Path) -> Result<ModrinthManifest, String> {
@@ -607,22 +676,77 @@ fn version_is_a_profile_token(value: &str, version: &str) -> bool {
     })
 }
 
-fn metadata_has_loader(metadata: &Value, loader: &str) -> bool {
-    let coordinate = format!("net.fabricmc:fabric-loader:{loader}");
+fn loader_library_matches(name: &str, minecraft: &str, loader: &LoaderPin) -> bool {
+    let Some((group_and_artifact, version)) = name.rsplit_once(':') else {
+        return false;
+    };
+    match loader.kind {
+        LoaderKind::Fabric => {
+            group_and_artifact == "net.fabricmc:fabric-loader" && version == loader.version
+        }
+        LoaderKind::Quilt => {
+            group_and_artifact == "org.quiltmc:quilt-loader" && version == loader.version
+        }
+        LoaderKind::Forge => {
+            let expected = if loader.version.starts_with(&format!("{minecraft}-")) {
+                loader.version.clone()
+            } else {
+                format!("{minecraft}-{}", loader.version)
+            };
+            group_and_artifact == "net.minecraftforge:forge" && version == expected
+        }
+        LoaderKind::NeoForge => {
+            group_and_artifact == "net.neoforged:neoforge" && version == loader.version
+        }
+    }
+}
+
+fn metadata_has_loader(metadata: &Value, minecraft: &str, loader: &LoaderPin) -> bool {
     metadata
         .get("libraries")
         .and_then(Value::as_array)
         .is_some_and(|libraries| {
             libraries.iter().any(|library| {
-                library.get("name").and_then(Value::as_str) == Some(coordinate.as_str())
+                library
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| loader_library_matches(name, minecraft, loader))
             })
         })
+}
+
+fn profile_id_has_loader(profile_id: &str, loader: &LoaderPin) -> bool {
+    let profile = profile_id.to_ascii_lowercase();
+    let marker = match loader.kind {
+        LoaderKind::Fabric => "fabric",
+        LoaderKind::Quilt => "quilt",
+        LoaderKind::Forge => "forge",
+        LoaderKind::NeoForge => "neoforge",
+    };
+    profile.contains(marker) && version_is_a_profile_token(profile_id, &loader.version)
 }
 
 fn find_installed_pack_profile(
     game_dir: &Path,
     minecraft: &str,
-    fabric_loader: Option<&str>,
+    loader: Option<&LoaderPin>,
+) -> Result<(String, Vec<(String, Value)>), String> {
+    find_installed_pack_profile_with_jar(game_dir, minecraft, loader, true)
+}
+
+fn find_installed_loader_profile(
+    game_dir: &Path,
+    minecraft: &str,
+    loader: &LoaderPin,
+) -> Result<(String, Vec<(String, Value)>), String> {
+    find_installed_pack_profile_with_jar(game_dir, minecraft, Some(loader), false)
+}
+
+fn find_installed_pack_profile_with_jar(
+    game_dir: &Path,
+    minecraft: &str,
+    loader: Option<&LoaderPin>,
+    require_client_jar: bool,
 ) -> Result<(String, Vec<(String, Value)>), String> {
     let versions_dir = game_dir.join("versions");
     let entries = fs::read_dir(&versions_dir).map_err(|error| {
@@ -666,29 +790,32 @@ fn find_installed_pack_profile(
         if !matches_minecraft {
             continue;
         }
-        let matches_loader = match fabric_loader {
-            Some(loader) => chain
-                .iter()
-                .any(|(_, item)| metadata_has_loader(item, loader)),
+        let matches_loader = match loader {
+            Some(loader) => {
+                chain.iter().any(|(id, item)| {
+                    metadata_has_loader(item, minecraft, loader)
+                        || profile_id_has_loader(id, loader)
+                }) || profile_id_has_loader(profile_id, loader)
+            }
             None => profile_id == minecraft,
         };
         if !matches_loader {
             continue;
         }
-        if !chain
+        let has_main_class = chain
             .iter()
-            .any(|(_, item)| item.get("mainClass").and_then(Value::as_str).is_some())
-            || !chain
-                .iter()
-                .any(|(id, _)| super::version_jar(game_dir, id).is_some())
-        {
+            .any(|(_, item)| item.get("mainClass").and_then(Value::as_str).is_some());
+        let has_client_jar = chain
+            .iter()
+            .any(|(id, _)| super::version_jar(game_dir, id).is_some());
+        if !has_main_class || (require_client_jar && !has_client_jar) {
             continue;
         }
         return Ok((profile_id.to_string(), chain));
     }
 
-    let loader = fabric_loader
-        .map(|version| format!(" with Fabric Loader {version}"))
+    let loader = loader
+        .map(|loader| format!(" with {} {}", loader.kind.label(), loader.version))
         .unwrap_or_default();
     Err(format!(
         "This ZIP needs Minecraft {minecraft}{loader}, but that profile is not installed in the selected .minecraft folder. Install and launch that profile once, then import the ZIP again. Bee ZIP imports do not fetch Minecraft's version list."
@@ -956,12 +1083,444 @@ fn copy_installed_assets(
     Ok(())
 }
 
+const MAX_LOADER_INSTALLER_BYTES: u64 = 128 * 1024 * 1024;
+const LOADER_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+fn forge_artifact_version(minecraft: &str, loader_version: &str) -> Result<String, String> {
+    if let Some((pinned_minecraft, _)) = loader_version.split_once('-') {
+        if pinned_minecraft
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+            && pinned_minecraft.contains('.')
+            && pinned_minecraft != minecraft
+            && loader_version.starts_with(&format!("{pinned_minecraft}-"))
+        {
+            return Err(format!(
+                "This Forge pack pins Minecraft {pinned_minecraft}, but its manifest pins Minecraft {minecraft}."
+            ));
+        }
+    }
+    if loader_version.starts_with(&format!("{minecraft}-")) {
+        Ok(loader_version.to_string())
+    } else {
+        Ok(format!("{minecraft}-{loader_version}"))
+    }
+}
+
+fn loader_installer_url(minecraft: &str, loader: &LoaderPin) -> Result<String, String> {
+    let version = match loader.kind {
+        LoaderKind::Forge => forge_artifact_version(minecraft, &loader.version)?,
+        LoaderKind::NeoForge => loader.version.clone(),
+        _ => return Err("This loader does not use an installer JAR.".to_string()),
+    };
+    let encoded_version = encode_path_segment(&version);
+    Ok(match loader.kind {
+        LoaderKind::Forge => format!(
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/{encoded_version}/forge-{encoded_version}-installer.jar"
+        ),
+        LoaderKind::NeoForge => format!(
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/{encoded_version}/neoforge-{encoded_version}-installer.jar"
+        ),
+        _ => unreachable!(),
+    })
+}
+
+fn download_loader_installer(
+    client: &Client,
+    url: &str,
+    destination: &Path,
+    loader: &LoaderPin,
+) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Refusing a non-HTTPS mod-loader installer source.".to_string());
+    }
+    let expected_host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .ok_or_else(|| "The mod-loader installer URL is invalid.".to_string())?;
+    let checksum_url = format!("{url}.sha1");
+    let checksum_response = client
+        .get(&checksum_url)
+        .timeout(Duration::from_secs(45))
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| {
+            format!(
+                "Could not verify the official {} installer checksum: {error}",
+                loader.kind.label()
+            )
+        })?;
+    if checksum_response.url().scheme() != "https"
+        || checksum_response
+            .url()
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case(&expected_host))
+    {
+        return Err(format!(
+            "The official {} checksum source redirected outside its HTTPS Maven host.",
+            loader.kind.label()
+        ));
+    }
+    let mut checksum_bytes = Vec::new();
+    checksum_response
+        .take(256)
+        .read_to_end(&mut checksum_bytes)
+        .map_err(|error| {
+            format!(
+                "Could not read the official {} installer checksum: {error}",
+                loader.kind.label()
+            )
+        })?;
+    let checksum_text = std::str::from_utf8(&checksum_bytes).map_err(|_| {
+        format!(
+            "The official {} checksum is not valid text.",
+            loader.kind.label()
+        )
+    })?;
+    let expected_sha1 = checksum_text
+        .split_whitespace()
+        .next()
+        .filter(|value| valid_sha1(value))
+        .ok_or_else(|| {
+            format!(
+                "The official {} checksum is malformed.",
+                loader.kind.label()
+            )
+        })?;
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| {
+            format!(
+                "Could not download the official {} installer: {error}",
+                loader.kind.label()
+            )
+        })?;
+    if response.url().scheme() != "https"
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_LOADER_INSTALLER_BYTES)
+    {
+        return Err(format!(
+            "The official {} installer redirected insecurely or exceeds the 128 MB safety limit.",
+            loader.kind.label()
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_LOADER_INSTALLER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "Could not read the official {} installer: {error}",
+                loader.kind.label()
+            )
+        })?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_LOADER_INSTALLER_BYTES {
+        return Err(format!(
+            "The official {} installer is empty or exceeds the 128 MB safety limit.",
+            loader.kind.label()
+        ));
+    }
+    if !sha1_bytes(&bytes).eq_ignore_ascii_case(expected_sha1) {
+        return Err(format!(
+            "The official {} installer failed its Maven SHA-1 integrity check.",
+            loader.kind.label()
+        ));
+    }
+    let mut archive = ZipArchive::new(io::Cursor::new(&bytes)).map_err(|error| {
+        format!(
+            "The official {} installer is not a valid JAR: {error}",
+            loader.kind.label()
+        )
+    })?;
+    if archive.by_name("META-INF/MANIFEST.MF").is_err() {
+        return Err(format!(
+            "The official {} installer JAR has no Java manifest.",
+            loader.kind.label()
+        ));
+    }
+    fs::write(destination, bytes).map_err(|error| {
+        format!(
+            "Could not stage the official {} installer: {error}",
+            loader.kind.label()
+        )
+    })
+}
+
+fn installer_log_excerpt(path: &Path) -> String {
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    if length > 8_000 {
+        let _ = file.seek(SeekFrom::Start(length - 8_000));
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+fn run_loader_installer(
+    app: Option<&AppHandle>,
+    java: &Path,
+    installer: &Path,
+    game_dir: &Path,
+    loader: &LoaderPin,
+) -> Result<(), String> {
+    let log_path = game_dir.join(".bee-loader-install.log");
+    let log = fs::File::create(&log_path).map_err(|error| {
+        format!(
+            "Could not create a private {} install log: {error}",
+            loader.kind.label()
+        )
+    })?;
+    let stdout = log.try_clone().map_err(|error| {
+        format!(
+            "Could not open the {} install log: {error}",
+            loader.kind.label()
+        )
+    })?;
+    let mut child = Command::new(java)
+        .arg("-Djava.net.useSystemProxies=true")
+        .arg("-Djava.awt.headless=true")
+        .arg("-jar")
+        .arg(installer)
+        .arg("--installClient")
+        .arg(game_dir)
+        .current_dir(game_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Could not start the official {} installer: {error}",
+                loader.kind.label()
+            )
+        })?;
+    let deadline = Instant::now() + LOADER_INSTALL_TIMEOUT;
+    let mut last_progress = String::new();
+    let mut last_report = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                if let Some(app) = app.filter(|_| last_report.elapsed() >= Duration::from_secs(2)) {
+                    let latest_line = installer_log_excerpt(&log_path)
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("Working in the isolated profile folder")
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(160)
+                        .collect::<String>();
+                    if latest_line != last_progress {
+                        report_progress(
+                            app,
+                            loader.kind.dependency_key(),
+                            format!("{} installer: {latest_line}", loader.kind.label()),
+                            0,
+                            1,
+                            28,
+                        );
+                        last_progress = latest_line;
+                    }
+                    last_report = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "The official {} installer did not finish within 15 minutes.",
+                    loader.kind.label()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Could not monitor the official {} installer: {error}",
+                    loader.kind.label()
+                ));
+            }
+        }
+    };
+    if !status.success() {
+        let excerpt = installer_log_excerpt(&log_path);
+        return Err(if excerpt.is_empty() {
+            format!(
+                "The official {} installer exited with {status}.",
+                loader.kind.label()
+            )
+        } else {
+            format!(
+                "The official {} installer exited with {status}. {}",
+                loader.kind.label(),
+                excerpt
+            )
+        });
+    }
+    let _ = fs::remove_file(&log_path);
+    Ok(())
+}
+
+fn install_loader_profile(
+    app: Option<&AppHandle>,
+    client: &Client,
+    game_dir: &Path,
+    minecraft: &str,
+    loader: &LoaderPin,
+    minecraft_metadata: &Value,
+) -> Result<String, String> {
+    let label = loader.kind.label();
+    if let Some(app) = app {
+        report_progress(
+            app,
+            loader.kind.dependency_key(),
+            format!("Resolving {label} {}", loader.version),
+            0,
+            1,
+            19,
+        );
+    }
+    match loader.kind {
+        LoaderKind::Fabric | LoaderKind::Quilt => {
+            let url = match loader.kind {
+                LoaderKind::Fabric => format!(
+                    "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
+                    encode_path_segment(minecraft),
+                    encode_path_segment(&loader.version)
+                ),
+                LoaderKind::Quilt => format!(
+                    "https://meta.quiltmc.org/v3/versions/loader/{}/{}/profile/json",
+                    encode_path_segment(minecraft),
+                    encode_path_segment(&loader.version)
+                ),
+                _ => unreachable!(),
+            };
+            let mut profile = request_json(
+                client,
+                &url,
+                &format!("{label} {} profile", loader.version),
+                None,
+                8 * 1024 * 1024,
+            )?;
+            let profile_id = profile
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label} did not return a version profile ID."))?
+                .to_string();
+            ensure_version_id(&profile_id)?;
+            if profile.get("inheritsFrom").and_then(Value::as_str) != Some(minecraft) {
+                return Err(format!(
+                    "The {label} profile does not inherit the modpack's pinned Minecraft version."
+                ));
+            }
+            if profile.get("mainClass").and_then(Value::as_str).is_none()
+                || !metadata_has_loader(&profile, minecraft, loader)
+            {
+                return Err(format!(
+                    "The {label} profile is missing its Java entry point or pinned loader library."
+                ));
+            }
+            if let Some(profile_id_field) = profile
+                .as_object_mut()
+                .and_then(|object| object.get_mut("id"))
+            {
+                *profile_id_field = Value::String(profile_id.clone());
+            }
+            let profile_path = safe_join(
+                game_dir,
+                &format!("versions/{profile_id}/{profile_id}.json"),
+            )?;
+            write_json(&profile_path, &profile, &format!("{label} profile"))?;
+            Ok(profile_id)
+        }
+        LoaderKind::Forge | LoaderKind::NeoForge => {
+            let url = loader_installer_url(minecraft, loader)?;
+            let installer_path = game_dir.join(".bee-loader-installer.jar");
+            let install_result = (|| {
+                download_loader_installer(client, &url, &installer_path, loader)?;
+                let required_java = super::required_java_major(minecraft_metadata);
+                let java =
+                    super::find_java_with_major(game_dir, required_java).ok_or_else(|| {
+                        required_java.map_or_else(
+                            || format!("Java is required to install {}.", label),
+                            |major| format!("Java {major} is required to install {}.", label),
+                        )
+                    })?;
+                let java = super::java_probe_path(&java);
+                if let Some(app) = app {
+                    report_progress(
+                        app,
+                        loader.kind.dependency_key(),
+                        format!(
+                            "Running the official {label} installer in the isolated pack folder"
+                        ),
+                        0,
+                        1,
+                        28,
+                    );
+                }
+                let registry_path = game_dir.join("launcher_profiles.json");
+                let previous_registry = match fs::read(&registry_path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not preserve the isolated launch profile registry: {error}"
+                        ));
+                    }
+                };
+                fs::write(&registry_path, br#"{"profiles":{}}"#).map_err(|error| {
+                    format!("Could not prepare the isolated {label} installer: {error}")
+                })?;
+                let run_result =
+                    run_loader_installer(app, &java, &installer_path, game_dir, loader);
+                let restore_result = match previous_registry {
+                    Some(bytes) => fs::write(&registry_path, bytes).map_err(|error| {
+                        format!("Could not restore the pack's launch profile registry: {error}")
+                    }),
+                    None => match fs::remove_file(&registry_path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(format!(
+                            "Could not remove the temporary launch profile registry: {error}"
+                        )),
+                    },
+                };
+                run_result?;
+                restore_result?;
+                find_installed_loader_profile(game_dir, minecraft, loader)
+                    .map(|(profile_id, _)| profile_id)
+                    .map_err(|_| {
+                        format!(
+                            "The official {label} installer finished, but did not create a profile matching Minecraft {minecraft} and {label} {}.",
+                            loader.version
+                        )
+                    })
+            })();
+            let _ = fs::remove_file(&installer_path);
+            install_result
+        }
+    }
+}
+
 fn install_version_metadata(
     app: Option<&AppHandle>,
     client: &Client,
     game_dir: &Path,
     minecraft: &str,
-    fabric_loader: Option<&str>,
+    loader: Option<&LoaderPin>,
 ) -> Result<String, String> {
     if let Some(app) = app {
         report_progress(
@@ -1006,8 +1565,16 @@ fn install_version_metadata(
         &minecraft_metadata,
         "Minecraft version metadata",
     )?;
-
-    let Some(loader) = fabric_loader else {
+    if let Some(loader) = loader {
+        install_loader_profile(
+            app,
+            client,
+            game_dir,
+            minecraft,
+            loader,
+            &minecraft_metadata,
+        )
+    } else {
         if let Some(app) = app {
             report_progress(
                 app,
@@ -1018,71 +1585,8 @@ fn install_version_metadata(
                 18,
             );
         }
-        return Ok(minecraft.to_string());
-    };
-    if let Some(app) = app {
-        report_progress(
-            app,
-            "fabric",
-            format!("Resolving Fabric Loader {loader}"),
-            0,
-            1,
-            19,
-        );
+        Ok(minecraft.to_string())
     }
-    let url = format!(
-        "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
-        encode_path_segment(minecraft),
-        encode_path_segment(loader)
-    );
-    let mut fabric_metadata = request_json(
-        client,
-        &url,
-        &format!("Fabric Loader {loader} profile"),
-        None,
-        8 * 1024 * 1024,
-    )?;
-    let profile_id = fabric_metadata
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Fabric did not return a version profile ID.".to_string())?
-        .to_string();
-    ensure_version_id(&profile_id)?;
-    if fabric_metadata.get("inheritsFrom").and_then(Value::as_str) != Some(minecraft) {
-        return Err(
-            "The Fabric profile does not inherit the modpack's pinned Minecraft version."
-                .to_string(),
-        );
-    }
-    if fabric_metadata
-        .get("mainClass")
-        .and_then(Value::as_str)
-        .is_none()
-    {
-        return Err("Fabric returned a profile without a Java main class.".to_string());
-    }
-    if let Some(profile_id_field) = fabric_metadata
-        .as_object_mut()
-        .and_then(|object| object.get_mut("id"))
-    {
-        *profile_id_field = Value::String(profile_id.clone());
-    }
-    let fabric_path = safe_join(
-        game_dir,
-        &format!("versions/{profile_id}/{profile_id}.json"),
-    )?;
-    write_json(&fabric_path, &fabric_metadata, "Fabric Loader profile")?;
-    if let Some(app) = app {
-        report_progress(
-            app,
-            "fabric",
-            format!("Fabric Loader {loader} profile ready"),
-            1,
-            1,
-            22,
-        );
-    }
-    Ok(profile_id)
 }
 
 fn sha512_file(path: &Path) -> Result<String, String> {
@@ -1598,7 +2102,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
     }
     report_progress(app, "validate", "Reading modpack manifest", 0, 1, 2);
     let manifest = read_manifest(&pack_path)?;
-    let (minecraft_version, fabric_loader) = validate_manifest(&manifest)?;
+    let (minecraft_version, loader) = validate_manifest(&manifest)?;
     let local_entries = local_bundle_entries(&pack_path, &manifest.files)?;
     let client_file_count = manifest
         .files
@@ -1640,11 +2144,8 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 1,
                 15,
             );
-            let (profile_id, source_chain) = find_installed_pack_profile(
-                source_game_dir,
-                &minecraft_version,
-                fabric_loader.as_deref(),
-            )?;
+            let (profile_id, source_chain) =
+                find_installed_pack_profile(source_game_dir, &minecraft_version, loader.as_ref())?;
             copy_installed_profile(source_game_dir, &instance_dir, &source_chain)?;
             let chain = super::metadata_chain(&instance_dir, &profile_id)?;
             report_progress(
@@ -1673,7 +2174,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 &client,
                 &instance_dir,
                 &minecraft_version,
-                fabric_loader.as_deref(),
+                loader.as_ref(),
             )?;
             report_progress(
                 app,
@@ -1711,7 +2212,12 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
             instance_id: instance_id.clone(),
             name: manifest.name.clone(),
             minecraft_version: minecraft_version.clone(),
-            fabric_loader: fabric_loader.clone(),
+            loader_name: loader.as_ref().map(|item| item.kind.label().to_string()),
+            loader_version: loader.as_ref().map(|item| item.version.clone()),
+            fabric_loader: loader
+                .as_ref()
+                .filter(|item| item.kind == LoaderKind::Fabric)
+                .map(|item| item.version.clone()),
             profile_id: profile_id.clone(),
             pack_version: manifest.version_id.clone(),
         };
@@ -1732,7 +2238,8 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
             instance_name: manifest.name.clone(),
             profile_key: format!("pack:{instance_id}:{profile_id}"),
             minecraft_version: minecraft_version.clone(),
-            fabric_loader: fabric_loader.clone(),
+            loader_name: loader.as_ref().map(|item| item.kind.label().to_string()),
+            loader_version: loader.as_ref().map(|item| item.version.clone()),
             files_installed: installed_files,
         })
     })();
@@ -1746,6 +2253,231 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
 mod tests {
     use super::*;
 
+    fn format_v1_manifest_value(loader: Option<(&str, &str)>) -> Value {
+        let mut dependencies = serde_json::Map::from_iter([(
+            "minecraft".to_string(),
+            Value::String("1.20.1".to_string()),
+        )]);
+        if let Some((key, version)) = loader {
+            dependencies.insert(key.to_string(), Value::String(version.to_string()));
+        }
+        serde_json::json!({
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "fixture-1",
+            "name": "Format fixture",
+            "files": [],
+            "dependencies": dependencies,
+        })
+    }
+
+    fn format_v1_manifest(loader: Option<(&str, &str)>) -> ModrinthManifest {
+        serde_json::from_value(format_v1_manifest_value(loader))
+            .expect("fixture should match the Modrinth format-v1 manifest")
+    }
+
+    #[test]
+    fn accepts_the_format_v1_loader_dependency_keys_and_pins() {
+        let cases = [
+            ("fabric-loader", "0.16.9", LoaderKind::Fabric),
+            ("quilt-loader", "0.30.0", LoaderKind::Quilt),
+            ("forge", "47.4.29", LoaderKind::Forge),
+            ("neoforge", "21.1.266", LoaderKind::NeoForge),
+        ];
+        for (key, version, kind) in cases {
+            let (minecraft, loader) = validate_manifest(&format_v1_manifest(Some((key, version))))
+                .unwrap_or_else(|error| panic!("{key} pack should validate: {error}"));
+            assert_eq!(minecraft, "1.20.1");
+            assert_eq!(
+                loader,
+                Some(LoaderPin {
+                    kind,
+                    version: version.to_string()
+                })
+            );
+        }
+        assert_eq!(
+            validate_manifest(&format_v1_manifest(None))
+                .expect("vanilla format-v1 pack should validate")
+                .1,
+            None
+        );
+    }
+
+    #[test]
+    fn parses_real_format_v1_mrpack_archives_for_each_supported_loader() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-mrpack-format-test-{unique}"));
+        fs::create_dir_all(&root).expect("temporary fixture folder should be created");
+        for (key, version, expected_kind) in [
+            ("fabric-loader", "0.16.9", LoaderKind::Fabric),
+            ("quilt-loader", "0.30.0", LoaderKind::Quilt),
+            ("forge", "47.4.29", LoaderKind::Forge),
+            ("neoforge", "21.1.266", LoaderKind::NeoForge),
+        ] {
+            let pack = root.join(format!("{key}.mrpack"));
+            let file = fs::File::create(&pack).expect("fixture archive should be created");
+            let mut archive = zip::ZipWriter::new(file);
+            archive
+                .start_file(
+                    "modrinth.index.json",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .expect("manifest entry should open");
+            archive
+                .write_all(
+                    &serde_json::to_vec(&format_v1_manifest_value(Some((key, version))))
+                        .expect("manifest should serialize"),
+                )
+                .expect("manifest should be written");
+            archive.finish().expect("fixture archive should close");
+
+            let parsed = read_manifest(&pack).expect("format-v1 archive manifest should parse");
+            let (minecraft, loader) =
+                validate_manifest(&parsed).expect("supported loader manifest should validate");
+            assert_eq!(minecraft, "1.20.1");
+            assert_eq!(
+                loader,
+                Some(LoaderPin {
+                    kind: expected_kind,
+                    version: version.to_string()
+                })
+            );
+        }
+        fs::remove_dir_all(root).expect("temporary fixture folder should be removed");
+    }
+
+    #[test]
+    fn matches_loader_profiles_by_their_exact_pinned_library_coordinate() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-loader-profile-match-{unique}"));
+        let minecraft = "1.20.1";
+        fs::create_dir_all(root.join("versions").join(minecraft))
+            .expect("vanilla metadata folder should be created");
+        fs::write(
+            root.join("versions")
+                .join(minecraft)
+                .join(format!("{minecraft}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "id": minecraft,
+                "mainClass": "net.minecraft.client.main.Main"
+            }))
+            .expect("vanilla metadata should encode"),
+        )
+        .expect("vanilla metadata should be written");
+
+        let cases = [
+            (
+                LoaderPin {
+                    kind: LoaderKind::Fabric,
+                    version: "0.16.9".to_string(),
+                },
+                "fabric-loader-0.16.9-1.20.1",
+                "net.fabricmc:fabric-loader:0.16.9",
+            ),
+            (
+                LoaderPin {
+                    kind: LoaderKind::Quilt,
+                    version: "0.30.0".to_string(),
+                },
+                "quilt-loader-0.30.0-1.20.1",
+                "org.quiltmc:quilt-loader:0.30.0",
+            ),
+            (
+                LoaderPin {
+                    kind: LoaderKind::Forge,
+                    version: "47.4.29".to_string(),
+                },
+                "1.20.1-forge-47.4.29",
+                "net.minecraftforge:forge:1.20.1-47.4.29",
+            ),
+            (
+                LoaderPin {
+                    kind: LoaderKind::NeoForge,
+                    version: "21.1.266".to_string(),
+                },
+                "neoforge-21.1.266",
+                "net.neoforged.fancymodloader:loader:4.0.45",
+            ),
+        ];
+        for (loader, profile_id, coordinate) in cases {
+            let profile_dir = root.join("versions").join(profile_id);
+            fs::create_dir_all(&profile_dir).expect("mod-loader profile folder should be created");
+            let profile = serde_json::json!({
+                "id": profile_id,
+                "inheritsFrom": minecraft,
+                "mainClass": "net.minecraft.client.main.Main",
+                "libraries": [{"name": coordinate}]
+            });
+            fs::write(
+                profile_dir.join(format!("{profile_id}.json")),
+                serde_json::to_vec(&profile).expect("loader metadata should encode"),
+            )
+            .expect("loader metadata should be written");
+            fs::write(profile_dir.join(format!("{profile_id}.jar")), b"client")
+                .expect("profile client jar should be written");
+            let (found_id, _) = find_installed_pack_profile(&root, minecraft, Some(&loader))
+                .expect("the exact pinned loader profile should be found");
+            assert_eq!(found_id, profile_id);
+        }
+        fs::remove_dir_all(root).expect("temporary profile fixture should be removed");
+    }
+
+    #[test]
+    fn rejects_multiple_and_unknown_modrinth_loader_dependencies() {
+        let mut conflicting = format_v1_manifest(Some(("fabric-loader", "0.16.9")));
+        conflicting
+            .dependencies
+            .insert("forge".to_string(), "47.4.29".to_string());
+        assert!(validate_manifest(&conflicting)
+            .unwrap_err()
+            .contains("more than one mod loader"));
+
+        let mut future_loader = format_v1_manifest(None);
+        future_loader
+            .dependencies
+            .insert("future-loader".to_string(), "1.0.0".to_string());
+        assert!(validate_manifest(&future_loader)
+            .unwrap_err()
+            .contains("unsupported future-loader dependency"));
+    }
+
+    #[test]
+    fn builds_pinned_forge_and_neoforge_installer_urls() {
+        let forge = LoaderPin {
+            kind: LoaderKind::Forge,
+            version: "47.4.29".to_string(),
+        };
+        assert_eq!(
+            loader_installer_url("1.20.1", &forge).unwrap(),
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.29/forge-1.20.1-47.4.29-installer.jar"
+        );
+        let full_forge_pin = LoaderPin {
+            kind: LoaderKind::Forge,
+            version: "1.20.1-47.4.29".to_string(),
+        };
+        assert_eq!(
+            loader_installer_url("1.20.1", &full_forge_pin).unwrap(),
+            loader_installer_url("1.20.1", &forge).unwrap()
+        );
+        assert!(loader_installer_url("1.21.1", &full_forge_pin).is_err());
+
+        let neoforge = LoaderPin {
+            kind: LoaderKind::NeoForge,
+            version: "21.1.266".to_string(),
+        };
+        assert_eq!(
+            loader_installer_url("1.21.1", &neoforge).unwrap(),
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.266/neoforge-21.1.266-installer.jar"
+        );
+    }
+
     #[test]
     fn parses_and_validates_the_supplied_outbreak_pack() {
         let pack = Path::new("/workspace/OUTBREAK-Last-Signal-1.0.0.mrpack");
@@ -1755,7 +2487,10 @@ mod tests {
         let manifest = read_manifest(pack).expect("pack manifest should parse");
         let (minecraft, fabric) = validate_manifest(&manifest).expect("pack should be supported");
         assert_eq!(minecraft, "26.3");
-        assert_eq!(fabric.as_deref(), Some("0.19.5"));
+        assert_eq!(
+            fabric.as_ref().map(|loader| loader.version.as_str()),
+            Some("0.19.5")
+        );
         assert_eq!(manifest.files.len(), 21);
         assert!(manifest
             .files
@@ -1773,7 +2508,10 @@ mod tests {
         let (minecraft, fabric) =
             validate_manifest(&manifest).expect("Bee ZIP manifest should be supported");
         assert_eq!(minecraft, "26.3");
-        assert_eq!(fabric.as_deref(), Some("0.19.5"));
+        assert_eq!(
+            fabric.as_ref().map(|loader| loader.version.as_str()),
+            Some("0.19.5")
+        );
         let entries = local_bundle_entries(pack, &manifest.files)
             .expect("bundle entries should match the manifest");
         assert_eq!(entries.len(), manifest.files.len());
@@ -1808,7 +2546,10 @@ mod tests {
         let manifest = read_manifest(pack).expect("Bee ZIP manifest should parse");
         let (minecraft, fabric) = validate_manifest(&manifest).expect("Bee ZIP manifest is valid");
         assert_eq!(minecraft, "26.3");
-        assert_eq!(fabric.as_deref(), Some("0.19.5"));
+        assert_eq!(
+            fabric.as_ref().map(|loader| loader.version.as_str()),
+            Some("0.19.5")
+        );
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1910,7 +2651,7 @@ mod tests {
         fs::write(&asset_path, asset_bytes).expect("fixture asset should be written");
 
         let (found_id, source_chain) =
-            find_installed_pack_profile(&source, &minecraft, fabric.as_deref())
+            find_installed_pack_profile(&source, &minecraft, fabric.as_ref())
                 .expect("installed Fabric profile should match the ZIP pins");
         assert_eq!(found_id, profile_id);
         copy_installed_profile(&source, &destination, &source_chain)
@@ -1996,9 +2737,12 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("bee-fabric-26-3-test-{unique}"));
         fs::create_dir_all(&directory).expect("temporary profile folder should be created");
         let client = super::super::downloader().expect("HTTP client should initialize");
-        let profile_id =
-            install_version_metadata(None, &client, &directory, "26.3", Some("0.19.5"))
-                .expect("Minecraft and Fabric metadata should install");
+        let loader = LoaderPin {
+            kind: LoaderKind::Fabric,
+            version: "0.19.5".to_string(),
+        };
+        let profile_id = install_version_metadata(None, &client, &directory, "26.3", Some(&loader))
+            .expect("Minecraft and Fabric metadata should install");
         assert_eq!(profile_id, "fabric-loader-0.19.5-26.3");
         let minecraft = fs::read_to_string(directory.join("versions/26.3/26.3.json"))
             .expect("Minecraft 26.3 metadata should be installed");

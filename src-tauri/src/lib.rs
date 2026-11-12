@@ -485,14 +485,14 @@ fn profile_kind(version_id: &str, metadata: &Value) -> String {
         })
         .unwrap_or_default();
     let combined = format!("{name} {library_text}");
-    if combined.contains("fabric") {
-        "Fabric".to_string()
-    } else if combined.contains("quilt") {
-        "Quilt".to_string()
+    if combined.contains("neoforge") {
+        "NeoForge".to_string()
     } else if combined.contains("forge") || combined.contains("minecraftforge") {
         "Forge".to_string()
-    } else if combined.contains("neoforge") {
-        "NeoForge".to_string()
+    } else if combined.contains("quilt") {
+        "Quilt".to_string()
+    } else if combined.contains("fabric") {
+        "Fabric".to_string()
     } else if combined.contains("optifine") {
         "OptiFine".to_string()
     } else if metadata.get("inheritsFrom").is_some() {
@@ -4294,6 +4294,27 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn classifies_loader_profiles_without_quilt_or_neoforge_crossmatching() {
+        let neoforge = serde_json::json!({
+            "inheritsFrom": "1.21.1",
+            "libraries": [{"name": "net.neoforged.fancymodloader:loader:4.0.45"}]
+        });
+        assert_eq!(profile_kind("neoforge-21.1.266", &neoforge), "NeoForge");
+
+        let quilt = serde_json::json!({
+            "inheritsFrom": "1.20.1",
+            "libraries": [{"name": "net.fabricmc:sponge-mixin:0.13.3+mixin.0.8.5"}]
+        });
+        assert_eq!(profile_kind("quilt-loader-0.30.0-1.20.1", &quilt), "Quilt");
+
+        let forge = serde_json::json!({
+            "inheritsFrom": "1.20.1",
+            "libraries": [{"name": "net.minecraftforge:forge:1.20.1-47.4.29"}]
+        });
+        assert_eq!(profile_kind("1.20.1-forge-47.4.29", &forge), "Forge");
+    }
 
     #[test]
     fn news_proxy_strategy_prefers_per_url_automatic_resolution() {
