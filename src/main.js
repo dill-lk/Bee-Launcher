@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.29', date: '2026-11-12', title: 'More reliable official Minecraft News',
+    changes: [
+      'Loads article cards from Minecraft.net’s official News page first, with its RSS feed as a fallback.',
+      'Correctly decodes the live RSS feed’s UTF-16 payload and Atom article links.',
+    ],
+  },
+  {
     version: '0.1.28', date: '2026-11-12', title: 'Reliable official Minecraft News',
     changes: [
       'Loads news from Minecraft.net’s first-party RSS feed instead of scraping the page layout.',
