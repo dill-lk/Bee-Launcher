@@ -32,6 +32,15 @@
   "bundle": {
     "active": true,
     "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "windows/bee-installer-header.bmp",
+        "sidebarImage": "windows/bee-installer-sidebar.bmp",
+        "uninstallerIcon": "icons/icon.ico",
+        "uninstallerHeaderImage": "windows/bee-uninstaller-header.bmp"
+      }
+    },
     "targets": ["nsis", "msi"]
   }
 }

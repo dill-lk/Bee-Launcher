@@ -59,6 +59,7 @@ const beeReleaseNotes = [
     changes: [
       'On the first modpack import from a selected .minecraft folder, physically copies its assets, libraries, and version metadata/JARs into Bee’s shared store; later profiles reuse that Bee-owned copy.',
       'Copies only immutable game-file folders. The selected source, mods, configs, saves, and other profile data stay untouched and isolated; conflicting shared files are preserved rather than overwritten.',
+      'The Windows installer and uninstaller now use Bee-themed artwork, matching icons, and a friendly farewell header.',
     ],
   },
   {
