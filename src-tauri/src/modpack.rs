@@ -1784,6 +1784,7 @@ fn copy_local_artifact(
 
 fn copy_installed_assets(
     app: Option<&AppHandle>,
+    client: &Client,
     source_game_dir: &Path,
     destination_game_dir: &Path,
     profile_game_dir: &Path,
@@ -1811,6 +1812,27 @@ fn copy_installed_assets(
         "The installed Minecraft profile has incomplete asset-index metadata.".to_string()
     })?;
     let index_path = safe_join(profile_game_dir, &spec.relative_path)?;
+    let source_index_path = safe_join(source_game_dir, &spec.relative_path)?;
+    if !artifact_matches(&index_path, spec.size, spec.sha1.as_deref())
+        && !artifact_matches(&source_index_path, spec.size, spec.sha1.as_deref())
+    {
+        let shared_index_path = safe_join(destination_game_dir, &spec.relative_path)?;
+        if artifact_matches(&shared_index_path, spec.size, spec.sha1.as_deref()) {
+            copy_local_file(
+                &shared_index_path,
+                &index_path,
+                spec.size,
+                spec.sha1.as_deref(),
+                "Minecraft asset index",
+            )?;
+        } else if let Some(app) = app {
+            // Asset-index IDs such as "34" can collide across Minecraft profiles.
+            // If both local copies are stale, download the metadata-pinned index;
+            // install_assets still reuses only checksum-verified shared objects.
+            install_assets(app, client, profile_game_dir, destination_game_dir, chain)?;
+            return Ok(());
+        }
+    }
     copy_local_artifact(
         source_game_dir,
         profile_game_dir,
@@ -2347,6 +2369,7 @@ fn install_loader_profile(
 
 fn reuse_installed_minecraft_base(
     app: Option<&AppHandle>,
+    client: &Client,
     source_game_dir: &Path,
     destination_game_dir: &Path,
     profile_game_dir: &Path,
@@ -2379,7 +2402,8 @@ fn reuse_installed_minecraft_base(
     copy_installed_profile(source_game_dir, destination_game_dir, &chain)?;
     copy_installed_libraries(source_game_dir, destination_game_dir, &chain)?;
     copy_installed_assets(
-        None,
+        app,
+        client,
         source_game_dir,
         destination_game_dir,
         profile_game_dir,
@@ -2408,7 +2432,14 @@ fn install_version_metadata(
         );
     }
     let local_metadata = if let Some(source_game_dir) = source_game_dir {
-        reuse_installed_minecraft_base(app, source_game_dir, game_dir, profile_game_dir, minecraft)?
+        reuse_installed_minecraft_base(
+            app,
+            client,
+            source_game_dir,
+            game_dir,
+            profile_game_dir,
+            minecraft,
+        )?
     } else {
         None
     };
@@ -3499,6 +3530,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
             let _ = super::install_bundled_authlib(&common_dir, &chain)?;
             copy_installed_assets(
                 Some(app),
+                &client,
                 source_game_dir,
                 &common_dir,
                 &instance_dir,
@@ -4033,7 +4065,7 @@ mod tests {
                     }
                 }),
             )];
-            copy_installed_assets(None, &source, &common, &profile, &chain)
+            copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
                 .expect("a conflicting common index must not block a verified local index");
             ensure_profile_shared_game_files(&profile, &common)
                 .expect("profile should share objects while keeping its own index");
@@ -4065,7 +4097,7 @@ mod tests {
 
             // An identical repeat for this instance is idempotent; a second
             // pack with another index body but the same ID stays independent.
-            copy_installed_assets(None, &source, &common, &profile, &chain)
+            copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
                 .expect("repeated import should reuse the instance's verified index");
             ensure_profile_shared_game_files(&profile, &common)
                 .expect("repeated sharing should remain idempotent");
@@ -4078,6 +4110,87 @@ mod tests {
             "neither repeated import may replace the shared index"
         );
         fs::remove_dir_all(root).expect("isolated fixture tree should be removed");
+    }
+
+    #[test]
+    fn stale_source_asset_index_reuses_verified_shared_index_and_objects() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-stale-asset-index-{unique}"));
+        let source = root.join("selected-minecraft");
+        let common = root.join("minecraft-common");
+        let profile = root.join("instances/stale-index-pack");
+        let asset_bytes = b"verified shared Minecraft asset";
+        let asset_hash = sha1_bytes(asset_bytes);
+        let expected_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "music/menu": {
+                    "hash": asset_hash.clone(),
+                    "size": asset_bytes.len()
+                }
+            }
+        }))
+        .expect("authoritative asset index should encode");
+        let expected_sha1 = sha1_bytes(&expected_index);
+        let stale_index = br#"{"objects":{"music/old":{"hash":"0000000000000000000000000000000000000000","size":1}}}"#;
+        let source_index = source.join("assets/indexes/34.json");
+        let shared_index = common.join("assets/indexes/34.json");
+        let shared_object = common.join(format!(
+            "assets/objects/{}/{}",
+            &asset_hash[..2],
+            asset_hash
+        ));
+        fs::create_dir_all(source_index.parent().unwrap())
+            .expect("source index directory should exist");
+        fs::create_dir_all(shared_index.parent().unwrap())
+            .expect("shared index directory should exist");
+        fs::create_dir_all(shared_object.parent().unwrap())
+            .expect("shared object directory should exist");
+        fs::write(&source_index, stale_index).expect("stale source index should be written");
+        fs::write(&shared_index, &expected_index).expect("verified shared index should be written");
+        fs::write(&shared_object, asset_bytes).expect("verified shared object should be written");
+
+        let chain = vec![(
+            "26.3".to_string(),
+            serde_json::json!({
+                "assetIndex": {
+                    "id": "34",
+                    "url": "https://example.invalid/34.json",
+                    "sha1": expected_sha1,
+                    "size": expected_index.len()
+                }
+            }),
+        )];
+        assert!(!artifact_matches(
+            &source_index,
+            Some(expected_index.len() as u64),
+            Some(&sha1_bytes(&expected_index))
+        ));
+
+        copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
+            .expect("a stale source index should reuse the checksum-matching shared index");
+        ensure_profile_shared_game_files(&profile, &common)
+            .expect("the profile should keep its index local and share object files");
+
+        assert_eq!(fs::read(&source_index).unwrap(), stale_index);
+        assert_eq!(
+            fs::read(profile.join("assets/indexes/34.json")).unwrap(),
+            expected_index
+        );
+        assert_eq!(fs::read(&shared_index).unwrap(), expected_index);
+        assert_eq!(fs::read(&shared_object).unwrap(), asset_bytes);
+        assert!(!is_linked_to(
+            &profile.join("assets/indexes"),
+            &common.join("assets/indexes")
+        ));
+        assert!(is_linked_to(
+            &profile.join("assets/objects"),
+            &common.join("assets/objects")
+        ));
+
+        fs::remove_dir_all(root).expect("isolated test fixture should be removed");
     }
 
     #[test]
@@ -4464,8 +4577,15 @@ mod tests {
             .expect("copied profile chain should be valid");
         copy_installed_libraries(&source, &destination, &chain)
             .expect("installed libraries should be reused");
-        copy_installed_assets(None, &source, &destination, &destination, &chain)
-            .expect("installed assets should be reused");
+        copy_installed_assets(
+            None,
+            &Client::new(),
+            &source,
+            &destination,
+            &destination,
+            &chain,
+        )
+        .expect("installed assets should be reused");
 
         let entries = local_bundle_entries(pack, &manifest.files)
             .expect("bundle entries should match the manifest");

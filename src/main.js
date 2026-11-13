@@ -55,6 +55,20 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.37', date: '2026-11-13', title: 'Restore Windows shortcut behavior',
+    changes: [
+      'The NSIS installer creates both the Bee Launcher Start Menu and Desktop shortcuts, and the uninstaller cleans up legacy Blockline Launcher shortcuts.',
+      'Restores the Bee shortcut icon and AppUserModelID on Start Menu, Desktop, and existing taskbar pins that target this installation.',
+    ],
+  },
+  {
+    version: '0.1.36', date: '2026-11-13', title: 'Recover from stale Minecraft asset indexes',
+    changes: [
+      'When an asset-index ID collides or is stale in the selected .minecraft folder, reuses a matching verified shared index or refreshes the metadata-pinned index instead of stopping the import.',
+      'Keeps each pack’s index private and reuses shared Minecraft asset objects only when their hashes match; the selected .minecraft folder remains untouched.',
+    ],
+  },
+  {
     version: '0.1.34', date: '2026-11-13', title: 'Safer modpack imports and a custom Bee setup',
     changes: [
       'Keeps each pack’s checksum-verified Minecraft asset index inside its own profile while sharing only hash-addressed asset objects. Packs that reuse an asset-index ID with different contents no longer block imports or replace another profile’s index.',
