@@ -360,6 +360,229 @@ fn merge_shared_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedGameStoreSeedState {
+    version: u32,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SharedGameStoreSeedResult {
+    already_seeded: bool,
+    copied_files: usize,
+    conflicts_left_unchanged: usize,
+}
+
+fn copy_tree_into_shared_store(
+    source: &Path,
+    destination: &Path,
+    result: &mut SharedGameStoreSeedResult,
+) -> Result<(), String> {
+    let source_meta = fs::symlink_metadata(source)
+        .map_err(|error| format!("Could not inspect {}: {error}", source.display()))?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+        return Err(format!(
+            "Refusing to copy a linked or non-directory Minecraft folder: {}",
+            source.display()
+        ));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to replace a linked or non-directory shared folder: {}",
+                destination.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(destination).map_err(|error| {
+                format!(
+                    "Could not create shared Minecraft folder {}: {error}",
+                    destination.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect shared Minecraft folder {}: {error}",
+                destination.display()
+            ));
+        }
+    }
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("Could not read {}: {error}", source.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Could not inspect a Minecraft file: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let kind = fs::symlink_metadata(&source_path)
+            .map_err(|error| format!("Could not inspect {}: {error}", source_path.display()))?
+            .file_type();
+        if kind.is_symlink() {
+            return Err(format!(
+                "Refusing to copy linked Minecraft data: {}",
+                source_path.display()
+            ));
+        }
+        if kind.is_dir() {
+            copy_tree_into_shared_store(&source_path, &destination_path, result)?;
+        } else if kind.is_file() {
+            match fs::symlink_metadata(&destination_path) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                    return Err(format!(
+                        "Refusing to replace a linked or non-file shared path: {}",
+                        destination_path.display()
+                    ));
+                }
+                Ok(_) => {
+                    if !files_have_same_bytes(&source_path, &destination_path).map_err(|error| {
+                        format!(
+                            "Could not compare shared Minecraft file {}: {error}",
+                            destination_path.display()
+                        )
+                    })? {
+                        result.conflicts_left_unchanged += 1;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::copy(&source_path, &destination_path).map_err(|error| {
+                        format!(
+                            "Could not physically copy {} into Bee's shared Minecraft store: {error}",
+                            source_path.display()
+                        )
+                    })?;
+                    result.copied_files += 1;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Could not inspect shared Minecraft file {}: {error}",
+                        destination_path.display()
+                    ));
+                }
+            }
+        } else {
+            return Err(format!(
+                "Refusing to copy a special Minecraft file: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn seed_shared_game_store_from_local_base(
+    source_root: &Path,
+    common_root: &Path,
+) -> Result<SharedGameStoreSeedResult, String> {
+    let source_key = fs::canonicalize(source_root)
+        .map_err(|error| format!("Could not resolve the selected .minecraft folder: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    let state_path = common_root.join(".bee-local-base.json");
+    let mut state = match fs::symlink_metadata(&state_path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err("Bee's shared Minecraft seed marker is not a regular file.".to_string());
+        }
+        Ok(_) => {
+            serde_json::from_slice::<SharedGameStoreSeedState>(&fs::read(&state_path).map_err(
+                |error| format!("Could not read Bee's shared Minecraft seed marker: {error}"),
+            )?)
+            .map_err(|error| format!("Bee's shared Minecraft seed marker is invalid: {error}"))?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SharedGameStoreSeedState {
+            version: 1,
+            sources: Vec::new(),
+        },
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect Bee's shared Minecraft seed marker: {error}"
+            ));
+        }
+    };
+    if state.version != 1 {
+        return Err("Bee's shared Minecraft seed marker uses an unsupported version.".to_string());
+    }
+    if state.sources.contains(&source_key) {
+        return Ok(SharedGameStoreSeedResult {
+            already_seeded: true,
+            ..SharedGameStoreSeedResult::default()
+        });
+    }
+
+    let mut available_folders = Vec::new();
+    for folder in ["assets", "libraries", "versions"] {
+        let source = source_root.join(folder);
+        match fs::symlink_metadata(&source) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(format!(
+                    "The selected .minecraft {folder} path is not a regular folder: {}",
+                    source.display()
+                ));
+            }
+            Ok(_) => available_folders.push((folder, source)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("Could not inspect {}: {error}", source.display()));
+            }
+        }
+    }
+    if available_folders.is_empty() {
+        return Ok(SharedGameStoreSeedResult::default());
+    }
+
+    let common_root = fs::canonicalize(common_root)
+        .map_err(|error| format!("Could not resolve Bee's shared Minecraft folder: {error}"))?;
+    let mut result = SharedGameStoreSeedResult::default();
+    for (folder, source) in available_folders {
+        let canonical_source = fs::canonicalize(&source)
+            .map_err(|error| format!("Could not resolve {}: {error}", source.display()))?;
+        let destination = common_root.join(folder);
+        if destination.starts_with(&canonical_source) {
+            return Err(format!(
+                "Bee's shared {folder} folder is inside the selected .minecraft source and cannot be safely copied."
+            ));
+        }
+        copy_tree_into_shared_store(&source, &destination, &mut result)?;
+    }
+
+    state.sources.push(source_key);
+    let marker = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("Could not encode Bee's shared Minecraft seed marker: {error}"))?;
+    let temporary_marker = common_root.join(format!(".bee-local-base.{}.tmp", std::process::id()));
+    fs::write(&temporary_marker, marker)
+        .map_err(|error| format!("Could not write Bee's shared Minecraft seed marker: {error}"))?;
+    let backup_marker = common_root.join(format!(".bee-local-base.{}.bak", std::process::id()));
+    let had_previous_marker = state_path.exists();
+    if had_previous_marker && backup_marker.exists() {
+        let _ = fs::remove_file(&temporary_marker);
+        return Err("A previous Bee Minecraft seed-marker backup already exists.".to_string());
+    }
+    if had_previous_marker {
+        if let Err(error) = fs::rename(&state_path, &backup_marker) {
+            let _ = fs::remove_file(&temporary_marker);
+            return Err(format!(
+                "Could not stage Bee's shared Minecraft seed marker: {error}"
+            ));
+        }
+    }
+    if let Err(error) = fs::rename(&temporary_marker, &state_path) {
+        if had_previous_marker {
+            let _ = fs::rename(&backup_marker, &state_path);
+        }
+        let _ = fs::remove_file(&temporary_marker);
+        return Err(format!(
+            "Could not finalize Bee's shared Minecraft seed marker: {error}"
+        ));
+    }
+    if had_previous_marker {
+        let _ = fs::remove_file(backup_marker);
+    }
+    Ok(result)
+}
+
 #[cfg(unix)]
 fn create_directory_link(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -3065,6 +3288,31 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 details.minecraft_version
             ));
         }
+        if let Some(source_root) = installed_game_dir.as_deref() {
+            report_progress(
+                app,
+                "minecraft",
+                "Copying .minecraft assets, libraries, and versions into Bee's shared store",
+                0,
+                1,
+                8,
+            );
+            let seed = seed_shared_game_store_from_local_base(source_root, &common_dir)?;
+            if seed.conflicts_left_unchanged > 0 {
+                warnings.push(format!(
+                    "{} pre-existing shared Minecraft file(s) differed from the selected .minecraft base and were left unchanged.",
+                    seed.conflicts_left_unchanged
+                ));
+            }
+            let message = if seed.already_seeded {
+                "Bee's shared Minecraft base is already copied; reusing it"
+            } else if seed.copied_files > 0 {
+                "Copied the selected .minecraft base into Bee's shared store"
+            } else {
+                "No local Minecraft base folders needed copying"
+            };
+            report_progress(app, "minecraft", message, 1, 1, 14);
+        }
         let profile_id = if let Some((source_game_dir, profile_id, source_chain)) = reusable {
             report_progress(
                 app,
@@ -3327,6 +3575,139 @@ mod tests {
             ]
         );
         fs::remove_file(pack).expect("fixture archive should be removed");
+    }
+
+    #[test]
+    fn first_local_base_seed_is_physical_and_later_profiles_reuse_it() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-local-base-seed-{unique}"));
+        let source = root.join("selected-minecraft");
+        let common = root.join("bee-data/minecraft-common");
+        for directory in [
+            "assets/indexes",
+            "assets/objects/aa",
+            "libraries/com/example",
+            "versions/1.20.1",
+            "mods",
+            "config",
+            "saves/world",
+        ] {
+            fs::create_dir_all(source.join(directory)).expect("fixture folder should be created");
+        }
+        fs::create_dir_all(&common).expect("shared store should exist");
+        fs::write(source.join("assets/indexes/test.json"), b"asset index")
+            .expect("asset index should be written");
+        fs::write(source.join("assets/objects/aa/asset-hash"), b"asset bytes")
+            .expect("asset should be written");
+        fs::write(
+            source.join("libraries/com/example/library.jar"),
+            b"library bytes",
+        )
+        .expect("library should be written");
+        fs::write(
+            source.join("versions/1.20.1/1.20.1.json"),
+            b"version metadata",
+        )
+        .expect("version metadata should be written");
+        fs::write(
+            source.join("versions/1.20.1/1.20.1.jar"),
+            b"client jar bytes",
+        )
+        .expect("client JAR should be written");
+        fs::write(source.join("mods/source-only.jar"), b"source mod")
+            .expect("source mod should be written");
+        fs::write(source.join("config/source-only.json"), b"source config")
+            .expect("source config should be written");
+        fs::write(source.join("saves/world/level.dat"), b"source world")
+            .expect("source save should be written");
+
+        let first = seed_shared_game_store_from_local_base(&source, &common)
+            .expect("first import should seed a local Minecraft base");
+        assert_eq!(first.copied_files, 5);
+        assert!(!first.already_seeded);
+        for relative in [
+            "assets/indexes/test.json",
+            "assets/objects/aa/asset-hash",
+            "libraries/com/example/library.jar",
+            "versions/1.20.1/1.20.1.json",
+            "versions/1.20.1/1.20.1.jar",
+        ] {
+            let source_file = source.join(relative);
+            let shared_file = common.join(relative);
+            assert_eq!(
+                fs::read(&source_file).expect("source file should remain readable"),
+                fs::read(&shared_file).expect("a physical shared copy should exist")
+            );
+            assert_ne!(
+                fs::canonicalize(source_file).expect("source path should resolve"),
+                fs::canonicalize(shared_file).expect("shared path should resolve")
+            );
+        }
+        assert!(!common.join("mods").exists());
+        assert!(!common.join("config").exists());
+        assert!(!common.join("saves").exists());
+        assert_eq!(
+            fs::read(source.join("mods/source-only.jar")).unwrap(),
+            b"source mod"
+        );
+        assert_eq!(
+            fs::read(source.join("saves/world/level.dat")).unwrap(),
+            b"source world"
+        );
+
+        fs::write(
+            source.join("assets/objects/aa/asset-hash"),
+            b"changed later",
+        )
+        .expect("fixture source should be editable after the first import");
+        fs::create_dir_all(source.join("assets/objects/bb"))
+            .expect("fixture should be able to add a later asset");
+        fs::write(source.join("assets/objects/bb/new-asset"), b"new later")
+            .expect("fixture should gain a later asset");
+        let second = seed_shared_game_store_from_local_base(&source, &common)
+            .expect("second import should reuse the original shared base");
+        assert!(second.already_seeded);
+        assert_eq!(second.copied_files, 0);
+        assert_eq!(
+            fs::read(common.join("assets/objects/aa/asset-hash")).unwrap(),
+            b"asset bytes"
+        );
+        assert!(!common.join("assets/objects/bb/new-asset").exists());
+
+        let first_profile = root.join("instances/first-pack");
+        let second_profile = root.join("instances/second-pack");
+        for (profile, suffix) in [(&first_profile, "first"), (&second_profile, "second")] {
+            fs::create_dir_all(profile.join("mods")).expect("profile mods should be local");
+            fs::create_dir_all(profile.join("config")).expect("profile config should be local");
+            fs::create_dir_all(profile.join("saves/world")).expect("profile saves should be local");
+            fs::write(profile.join("mods/profile.jar"), suffix.as_bytes())
+                .expect("profile mod should be written");
+            fs::write(profile.join("config/profile.json"), suffix.as_bytes())
+                .expect("profile config should be written");
+            fs::write(profile.join("saves/world/level.dat"), suffix.as_bytes())
+                .expect("profile save should be written");
+            ensure_profile_shared_game_files(profile, &common)
+                .expect("imported profile should use Bee's shared files");
+            for folder in ["assets", "libraries", "versions"] {
+                assert!(is_linked_to(&profile.join(folder), &common.join(folder)));
+            }
+        }
+        assert_eq!(
+            fs::read(first_profile.join("mods/profile.jar")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(second_profile.join("mods/profile.jar")).unwrap(),
+            b"second"
+        );
+        assert_ne!(
+            fs::canonicalize(first_profile.join("mods/profile.jar")).unwrap(),
+            fs::canonicalize(second_profile.join("mods/profile.jar")).unwrap()
+        );
+        fs::remove_dir_all(root).expect("isolated fixture tree should be removed");
     }
 
     #[test]

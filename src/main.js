@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.33', date: '2026-11-13', title: 'Copy local Minecraft base on first import',
+    changes: [
+      'On the first modpack import from a selected .minecraft folder, physically copies its assets, libraries, and version metadata/JARs into Bee’s shared store; later profiles reuse that Bee-owned copy.',
+      'Copies only immutable game-file folders. The selected source, mods, configs, saves, and other profile data stay untouched and isolated; conflicting shared files are preserved rather than overwritten.',
+    ],
+  },
+  {
     version: '0.1.32', date: '2026-11-13', title: 'CurseForge packs and shared game files',
     changes: [
       'Imports CurseForge ZIP exports directly, including the supplied Satisfaction Guaranteed pack, and resolves its pinned files from CurseForge.',

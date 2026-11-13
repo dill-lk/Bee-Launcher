@@ -6,7 +6,7 @@
 
 # Bee Launcher
 
-**Version 0.1.32** · Tauri 2 · Windows-first Minecraft: Java Edition launcher
+**Version 0.1.33** · Tauri 2 · Windows-first Minecraft: Java Edition launcher
 
 Bee Launcher finds Minecraft Java profiles already installed on your PC and launches the one you choose. It also provides isolated modpack profiles, local world backups, launcher customization, and troubleshooting helpers. It is an independent project—not an official Mojang or Microsoft launcher.
 
