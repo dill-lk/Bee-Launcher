@@ -24,6 +24,7 @@ const MINECRAFT_VERSION_MANIFEST_URLS: [&str; 2] = [
     "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json",
 ];
 const METADATA_REQUEST_ATTEMPTS: usize = 3;
+static SHARED_GAME_FILES_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +36,101 @@ struct ModrinthManifest {
     name: String,
     files: Vec<ModrinthFile>,
     dependencies: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeManifest {
+    manifest_type: String,
+    manifest_version: u32,
+    name: String,
+    version: String,
+    minecraft: CurseForgeMinecraft,
+    files: Vec<CurseForgeDependency>,
+    #[serde(default)]
+    overrides: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeMinecraft {
+    version: String,
+    #[serde(default)]
+    mod_loaders: Vec<CurseForgeLoader>,
+    #[serde(default)]
+    recommended_ram: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeLoader {
+    id: String,
+    #[serde(default)]
+    primary: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeDependency {
+    #[serde(rename = "projectID")]
+    project_id: u64,
+    #[serde(rename = "fileID")]
+    file_id: u64,
+    #[serde(default = "default_required")]
+    required: bool,
+}
+
+fn default_required() -> bool {
+    true
+}
+
+#[derive(Debug)]
+enum PackManifest {
+    Modrinth(ModrinthManifest),
+    CurseForge(CurseForgeManifest),
+}
+
+#[derive(Debug)]
+struct PackDetails {
+    name: String,
+    version: Option<String>,
+    minecraft_version: String,
+    loader: Option<LoaderPin>,
+    recommended_ram_mb: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeFileResponse {
+    data: CurseForgeFileMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFileMetadata {
+    id: u64,
+    project_id: u64,
+    file_name: String,
+    file_length: u64,
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    is_compatible_with_client: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurseForgeDestination {
+    Mods,
+    Resourcepacks,
+    Shaderpacks,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedCurseForgeFile {
+    project_id: u64,
+    file_id: u64,
+    file_name: String,
+    file_length: u64,
+    download_url: String,
+    relative_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -121,6 +217,7 @@ pub(super) struct ImportResult {
     loader_name: Option<String>,
     loader_version: Option<String>,
     files_installed: usize,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -162,6 +259,210 @@ fn app_instances_dir(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&root)
         .map_err(|error| format!("Could not create Bee Launcher's instances folder: {error}"))?;
     Ok(root)
+}
+
+fn app_shared_game_files_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not find Bee Launcher's data folder: {error}"))?
+        .join("minecraft-common");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Could not create the shared Minecraft file folder: {error}"))?;
+    Ok(root)
+}
+
+fn files_have_same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
+    let left_meta = fs::metadata(left)?;
+    let right_meta = fs::metadata(right)?;
+    if !left_meta.is_file() || !right_meta.is_file() || left_meta.len() != right_meta.len() {
+        return Ok(false);
+    }
+    let mut left_file = fs::File::open(left)?;
+    let mut right_file = fs::File::open(right)?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_count = left_file.read(&mut left_buffer)?;
+        let right_count = right_file.read(&mut right_buffer)?;
+        if left_count != right_count || left_buffer[..left_count] != right_buffer[..right_count] {
+            return Ok(false);
+        }
+        if left_count == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn merge_shared_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+    let source_meta = fs::symlink_metadata(source)
+        .map_err(|error| format!("Could not inspect {}: {error}", source.display()))?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+        return Err(format!(
+            "Refusing to share a non-directory or linked game folder: {}",
+            source.display()
+        ));
+    }
+    fs::create_dir_all(destination).map_err(|error| {
+        format!(
+            "Could not prepare shared folder {}: {error}",
+            destination.display()
+        )
+    })?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("Could not read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Could not inspect a game file: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect {}: {error}", source_path.display()))?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "Refusing to share linked game data: {}",
+                source_path.display()
+            ));
+        }
+        if kind.is_dir() {
+            merge_shared_tree(&source_path, &destination_path)?;
+        } else if kind.is_file() {
+            if destination_path.exists() {
+                if !files_have_same_bytes(&source_path, &destination_path).map_err(|error| {
+                    format!(
+                        "Could not compare shared file {}: {error}",
+                        destination_path.display()
+                    )
+                })? {
+                    return Err(format!(
+                        "A different file already exists at {}. The existing profile was left intact and its common game files were not replaced.",
+                        destination_path.display()
+                    ));
+                }
+            } else {
+                fs::copy(&source_path, &destination_path).map_err(|error| {
+                    format!(
+                        "Could not add {} to the shared game-file store: {error}",
+                        source_path.display()
+                    )
+                })?;
+            }
+        } else {
+            return Err(format!(
+                "Refusing to share a special game file: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link: &Path) -> io::Result<()> {
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "Windows could not create a directory junction: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_link(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory links are not supported on this platform",
+    ))
+}
+
+fn is_linked_to(path: &Path, target: &Path) -> bool {
+    path.is_dir()
+        && fs::canonicalize(path)
+            .ok()
+            .zip(fs::canonicalize(target).ok())
+            .is_some_and(|(actual, expected)| actual == expected)
+}
+
+fn ensure_profile_shared_game_files(profile_dir: &Path, common_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(profile_dir)
+        .map_err(|error| format!("Could not prepare the modpack profile folder: {error}"))?;
+    for folder in ["assets", "libraries", "versions"] {
+        let shared_path = common_dir.join(folder);
+        fs::create_dir_all(&shared_path)
+            .map_err(|error| format!("Could not prepare shared {folder}: {error}"))?;
+        let profile_path = profile_dir.join(folder);
+        if is_linked_to(&profile_path, &shared_path) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&profile_path);
+        match metadata {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(format!(
+                    "Refusing to replace a linked or non-directory profile path: {}",
+                    profile_path.display()
+                ));
+            }
+            Ok(_) => merge_shared_tree(&profile_path, &shared_path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect {}: {error}",
+                    profile_path.display()
+                ))
+            }
+        }
+        let backup = profile_dir.join(format!(".{folder}.bee-local-backup"));
+        if backup.exists() {
+            return Err(format!(
+                "A previous safe migration copy already exists at {}; it was left untouched.",
+                backup.display()
+            ));
+        }
+        let had_local_dir = profile_path.exists();
+        if had_local_dir {
+            fs::rename(&profile_path, &backup).map_err(|error| {
+                format!(
+                    "Could not stage {} for a safe shared-store switch: {error}",
+                    profile_path.display()
+                )
+            })?;
+        }
+        if let Err(error) = create_directory_link(&shared_path, &profile_path) {
+            if had_local_dir {
+                let _ = fs::rename(&backup, &profile_path);
+            }
+            return Err(format!(
+                "Could not link this profile to shared {folder}: {error}"
+            ));
+        }
+        if had_local_dir {
+            if let Err(error) = fs::remove_dir_all(&backup) {
+                return Err(format!(
+                    "The profile now uses shared {folder}, but its unchanged migration copy remains at {} because cleanup failed: {error}",
+                    backup.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn safe_pack_path(path: &str) -> Result<PathBuf, String> {
@@ -322,6 +623,89 @@ fn validate_manifest(manifest: &ModrinthManifest) -> Result<(String, Option<Load
     Ok((minecraft.clone(), loader))
 }
 
+fn parse_curseforge_loader(id: &str) -> Result<LoaderPin, String> {
+    let variants = [
+        ("fabric-", LoaderKind::Fabric),
+        ("quilt-loader-", LoaderKind::Quilt),
+        ("quilt-", LoaderKind::Quilt),
+        ("forge-", LoaderKind::Forge),
+        ("neoforge-", LoaderKind::NeoForge),
+    ];
+    for (prefix, kind) in variants {
+        if let Some(version) = id.strip_prefix(prefix) {
+            validate_dependency_version(version, kind.label())?;
+            return Ok(LoaderPin {
+                kind,
+                version: version.to_string(),
+            });
+        }
+    }
+    Err(format!(
+        "This CurseForge pack pins the unsupported loader '{id}'. Bee Launcher supports Fabric, Quilt, Forge, and NeoForge."
+    ))
+}
+
+fn validate_curseforge_manifest(manifest: &CurseForgeManifest) -> Result<PackDetails, String> {
+    if manifest.manifest_type != "minecraftModpack" || manifest.manifest_version != 1 {
+        return Err(
+            "Bee Launcher supports CurseForge Minecraft modpack manifest version 1 only."
+                .to_string(),
+        );
+    }
+    if manifest.name.trim().is_empty() || manifest.name.trim().len() > 160 {
+        return Err("The CurseForge pack has a missing or invalid display name.".to_string());
+    }
+    if manifest.version.trim().is_empty() || manifest.version.trim().len() > 100 {
+        return Err("The CurseForge pack has a missing or invalid version.".to_string());
+    }
+    if manifest
+        .overrides
+        .as_deref()
+        .is_some_and(|folder| folder != "overrides" && folder != "client-overrides")
+    {
+        return Err("This CurseForge ZIP uses an unsupported overrides folder name.".to_string());
+    }
+    validate_dependency_version(&manifest.minecraft.version, "Minecraft")?;
+    if manifest.files.len() > MAX_PACK_FILES {
+        return Err("This CurseForge pack contains too many files to import safely.".to_string());
+    }
+    let mut ids = HashSet::new();
+    for file in &manifest.files {
+        if !ids.insert((file.project_id, file.file_id)) {
+            return Err(format!(
+                "The CurseForge manifest lists project {} file {} more than once.",
+                file.project_id, file.file_id
+            ));
+        }
+    }
+    let primary: Vec<&CurseForgeLoader> = manifest
+        .minecraft
+        .mod_loaders
+        .iter()
+        .filter(|loader| loader.primary)
+        .collect();
+    if primary.len() > 1 || manifest.minecraft.mod_loaders.len() > 1 {
+        return Err("This CurseForge pack pins more than one loader; Bee Launcher can import only one loader per profile.".to_string());
+    }
+    let loader = manifest
+        .minecraft
+        .mod_loaders
+        .first()
+        .map(|loader| parse_curseforge_loader(&loader.id))
+        .transpose()?;
+    let recommended_ram_mb = manifest
+        .minecraft
+        .recommended_ram
+        .filter(|ram| (1024..=131_072).contains(ram));
+    Ok(PackDetails {
+        name: manifest.name.clone(),
+        version: Some(manifest.version.clone()),
+        minecraft_version: manifest.minecraft.version.clone(),
+        loader,
+        recommended_ram_mb,
+    })
+}
+
 fn read_manifest(path: &Path) -> Result<ModrinthManifest, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("Could not read the .mrpack file: {error}"))?;
@@ -364,6 +748,42 @@ fn read_manifest(path: &Path) -> Result<ModrinthManifest, String> {
         .map_err(|error| format!("Could not read the modpack manifest: {error}"))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("The modpack manifest is invalid: {error}"))
+}
+
+fn read_any_manifest(path: &Path) -> Result<PackManifest, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !extension.eq_ignore_ascii_case("zip") {
+        return read_manifest(path).map(PackManifest::Modrinth);
+    }
+    let file =
+        fs::File::open(path).map_err(|error| format!("Could not open the ZIP modpack: {error}"))?;
+    let archive = ZipArchive::new(file)
+        .map_err(|error| format!("That modpack is not a valid ZIP archive: {error}"))?;
+    let has_curseforge_manifest = archive.file_names().any(|name| name == "manifest.json");
+    drop(archive);
+    if has_curseforge_manifest {
+        let file = fs::File::open(path)
+            .map_err(|error| format!("Could not reopen the CurseForge ZIP: {error}"))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|error| format!("Could not read the CurseForge ZIP: {error}"))?;
+        let mut entry = archive
+            .by_name("manifest.json")
+            .map_err(|error| format!("Could not read the CurseForge manifest: {error}"))?;
+        if entry.size() > MAX_MANIFEST_BYTES {
+            return Err("The CurseForge manifest is unexpectedly large.".to_string());
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("Could not read the CurseForge manifest: {error}"))?;
+        let manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("The CurseForge manifest is invalid: {error}"))?;
+        return Ok(PackManifest::CurseForge(manifest));
+    }
+    read_manifest(path).map(PackManifest::Modrinth)
 }
 
 fn safe_slug(name: &str) -> String {
@@ -441,6 +861,20 @@ fn copy_overrides(pack_path: &Path, destination: &Path, app: &AppHandle) -> Resu
             ));
         }
         let relative = safe_pack_path(relative_name)?;
+        if relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|root| {
+                ["assets", "libraries", "versions", "runtime"]
+                    .iter()
+                    .any(|reserved| root.eq_ignore_ascii_case(reserved))
+            })
+        {
+            return Err(format!(
+                "The pack override {relative_name} targets Bee Launcher's shared game-file area and was refused."
+            ));
+        }
         let target = safe_join(destination, relative_name)?;
         if !seen.insert(relative.clone()) {
             return Err(format!(
@@ -832,6 +1266,12 @@ fn copy_local_file(
     if artifact_matches(destination, expected_size, expected_sha1) {
         return Ok(());
     }
+    if destination.exists() {
+        return Err(format!(
+            "A different file already exists at {}; it was left unchanged instead of being replaced with {label}.",
+            destination.display()
+        ));
+    }
     if !artifact_matches(source, expected_size, expected_sha1) {
         return Err(format!(
             "Could not reuse the installed {label} from {}. Open that Minecraft profile once so its files are installed, then retry the ZIP import.",
@@ -843,14 +1283,9 @@ fn copy_local_file(
         .ok_or_else(|| format!("Invalid destination for {label}."))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("Could not create the folder for {label}: {error}"))?;
-    if destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|error| format!("Could not replace the local {label}: {error}"))?;
-    }
-    if fs::hard_link(source, destination).is_err() {
-        fs::copy(source, destination)
-            .map_err(|error| format!("Could not reuse the installed {label}: {error}"))?;
-    }
+    fs::copy(source, destination).map_err(|error| {
+        format!("Could not copy the installed {label} into Bee Launcher's shared store: {error}")
+    })?;
     if !artifact_matches(destination, expected_size, expected_sha1) {
         let _ = fs::remove_file(destination);
         return Err(format!(
@@ -868,7 +1303,16 @@ fn copy_installed_profile(
     for (id, metadata) in chain {
         ensure_version_id(id)?;
         let json_path = safe_join(destination_game_dir, &format!("versions/{id}/{id}.json"))?;
-        write_json(&json_path, metadata, "reused Minecraft profile metadata")?;
+        if json_path.exists() {
+            if super::metadata_at(destination_game_dir, id).as_ref() != Some(metadata) {
+                return Err(format!(
+                    "A different Minecraft profile metadata file already exists at {}; it was left unchanged.",
+                    json_path.display()
+                ));
+            }
+        } else {
+            write_json(&json_path, metadata, "reused Minecraft profile metadata")?;
+        }
         let source_jar = super::version_jar(source_game_dir, id).ok_or_else(|| {
             format!(
                 "The installed profile {id} is missing its client JAR; launch it once, then retry."
@@ -1442,7 +1886,19 @@ fn install_loader_profile(
                 game_dir,
                 &format!("versions/{profile_id}/{profile_id}.json"),
             )?;
-            write_json(&profile_path, &profile, &format!("{label} profile"))?;
+            if profile_path.exists() {
+                let existing = fs::read(&profile_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                if existing.as_ref() != Some(&profile) {
+                    return Err(format!(
+                        "A different {label} profile already exists at {}; it was left unchanged.",
+                        profile_path.display()
+                    ));
+                }
+            } else {
+                write_json(&profile_path, &profile, &format!("{label} profile"))?;
+            }
             Ok(profile_id)
         }
         LoaderKind::Forge | LoaderKind::NeoForge => {
@@ -1560,12 +2016,24 @@ fn install_version_metadata(
         return Err("Mojang returned metadata for a different Minecraft version.".to_string());
     }
     let minecraft_path = safe_join(game_dir, &format!("versions/{minecraft}/{minecraft}.json"))?;
-    write_json(
-        &minecraft_path,
-        &minecraft_metadata,
-        "Minecraft version metadata",
-    )?;
+    if minecraft_path.exists() {
+        if super::metadata_at(game_dir, minecraft).as_ref() != Some(&minecraft_metadata) {
+            return Err(format!(
+                "A different Minecraft {minecraft} profile already exists at {}; it was left unchanged.",
+                minecraft_path.display()
+            ));
+        }
+    } else {
+        write_json(
+            &minecraft_path,
+            &minecraft_metadata,
+            "Minecraft version metadata",
+        )?;
+    }
     if let Some(loader) = loader {
+        if let Ok((profile_id, _)) = find_installed_loader_profile(game_dir, minecraft, loader) {
+            return Ok(profile_id);
+        }
         install_loader_profile(
             app,
             client,
@@ -1696,6 +2164,359 @@ fn download_pack_file(client: &Client, game_dir: &Path, file: &ModrinthFile) -> 
         file.path,
         failures.join(" | ")
     ))
+}
+
+fn curseforge_destinations(
+    pack_path: &Path,
+    dependency_count: usize,
+) -> Result<Vec<CurseForgeDestination>, String> {
+    let file = fs::File::open(pack_path)
+        .map_err(|error| format!("Could not inspect the CurseForge ZIP: {error}"))?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|error| format!("Could not inspect the CurseForge ZIP: {error}"))?;
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|name| *name == "modlist.html" || name.ends_with("/modlist.html"))
+        .map(str::to_string)
+        .collect();
+    if names.len() > 1 {
+        return Err("This CurseForge ZIP contains more than one modlist.html.".to_string());
+    }
+    let Some(name) = names.first() else {
+        return Ok(vec![CurseForgeDestination::Mods; dependency_count]);
+    };
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|error| format!("Could not read the CurseForge mod list: {error}"))?;
+    if entry.size() > 8 * 1024 * 1024 {
+        return Err("The CurseForge mod list is unexpectedly large.".to_string());
+    }
+    let mut html = String::with_capacity(entry.size() as usize);
+    entry
+        .read_to_string(&mut html)
+        .map_err(|error| format!("Could not read the CurseForge mod list: {error}"))?;
+    let mut destinations = Vec::new();
+    for anchor in html.split("<a ").skip(1) {
+        let Some(href_at) = anchor.find("href=") else {
+            continue;
+        };
+        let value = anchor[href_at + 5..].trim_start();
+        let Some(quote) = value
+            .chars()
+            .next()
+            .filter(|quote| *quote == '\'' || *quote == '"')
+        else {
+            continue;
+        };
+        let Some(end) = value[1..].find(quote) else {
+            continue;
+        };
+        let url = &value[1..end + 1];
+        let lower = url.to_ascii_lowercase();
+        let destination = if lower.contains("/minecraft/texture-packs/") {
+            Some(CurseForgeDestination::Resourcepacks)
+        } else if lower.contains("/minecraft/shaders/") {
+            Some(CurseForgeDestination::Shaderpacks)
+        } else if lower.contains("/minecraft/mc-mods/") {
+            Some(CurseForgeDestination::Mods)
+        } else {
+            None
+        };
+        if let Some(destination) = destination {
+            destinations.push(destination);
+        }
+    }
+    if destinations.len() != dependency_count {
+        return Err(format!(
+            "The CurseForge mod list has {} classifiable entries but the manifest lists {dependency_count} dependencies. Bee Launcher will not guess where ZIP files belong.",
+            destinations.len()
+        ));
+    }
+    Ok(destinations)
+}
+
+fn safe_curseforge_filename(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.ends_with('.')
+        || value.ends_with(' ')
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '"' | '<' | '>' | '|' | '?' | '*'
+                )
+        })
+    {
+        return Err("CurseForge returned an unsafe download filename.".to_string());
+    }
+    let stem = value.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
+    {
+        return Err("CurseForge returned a reserved Windows filename.".to_string());
+    }
+    Ok(())
+}
+
+fn resolve_curseforge_files(
+    app: &AppHandle,
+    client: &Client,
+    pack_path: &Path,
+    manifest: &CurseForgeManifest,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<ResolvedCurseForgeFile>, String> {
+    let destinations = curseforge_destinations(pack_path, manifest.files.len())?;
+    let required: Vec<(usize, &CurseForgeDependency)> = manifest
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.required)
+        .collect();
+    if required.is_empty() {
+        report_progress(
+            app,
+            "dependencies",
+            "This CurseForge pack has no required files",
+            0,
+            0,
+            77,
+        );
+        return Ok(Vec::new());
+    }
+    let mut resolved = Vec::with_capacity(required.len());
+    let mut seen_paths = HashSet::new();
+    let mut total_bytes = 0_u64;
+    let mut untagged_versions = Vec::new();
+    for (index, (manifest_index, dependency)) in required.iter().enumerate() {
+        let metadata_url = format!(
+            "https://www.curseforge.com/api/v1/mods/{}/files/{}",
+            dependency.project_id, dependency.file_id
+        );
+        let value = request_json(
+            client,
+            &metadata_url,
+            &format!("CurseForge file {} metadata", dependency.file_id),
+            None,
+            2 * 1024 * 1024,
+        )?;
+        let response: CurseForgeFileResponse = serde_json::from_value(value)
+            .map_err(|error| format!("CurseForge returned incomplete file metadata: {error}"))?;
+        let file = response.data;
+        if file.id != dependency.file_id || file.project_id != dependency.project_id {
+            return Err(format!(
+                "CurseForge returned a different file for project {} file {}.",
+                dependency.project_id, dependency.file_id
+            ));
+        }
+        if file.file_length == 0 || file.file_length > MAX_PACK_FILE_BYTES {
+            return Err(format!(
+                "CurseForge file {} has an invalid size.",
+                dependency.file_id
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(file.file_length);
+        if total_bytes > MAX_TOTAL_PACK_FILE_BYTES {
+            return Err(
+                "The CurseForge dependencies exceed Bee Launcher's 20 GB import limit.".to_string(),
+            );
+        }
+        if file.is_compatible_with_client == Some(false) {
+            return Err(format!(
+                "CurseForge file {} is explicitly marked as incompatible with Minecraft {} on the client.",
+                dependency.file_id, manifest.minecraft.version
+            ));
+        }
+        if !file
+            .game_versions
+            .iter()
+            .any(|version| version == &manifest.minecraft.version)
+        {
+            untagged_versions.push(file.file_name.clone());
+        }
+        safe_curseforge_filename(&file.file_name)?;
+        let root = match destinations[*manifest_index] {
+            CurseForgeDestination::Mods => "mods",
+            CurseForgeDestination::Resourcepacks => "resourcepacks",
+            CurseForgeDestination::Shaderpacks => "shaderpacks",
+        };
+        let relative_path = format!("{root}/{}", file.file_name);
+        if !seen_paths.insert(relative_path.to_ascii_lowercase()) {
+            return Err(format!(
+                "Two CurseForge dependencies would overwrite {relative_path}."
+            ));
+        }
+        resolved.push(ResolvedCurseForgeFile {
+            project_id: dependency.project_id,
+            file_id: dependency.file_id,
+            file_name: file.file_name,
+            file_length: file.file_length,
+            download_url: format!(
+                "https://www.curseforge.com/api/v1/mods/{}/files/{}/download",
+                dependency.project_id, dependency.file_id
+            ),
+            relative_path,
+        });
+        report_progress(
+            app,
+            "dependencies",
+            format!("Resolved CurseForge file {}/{}", index + 1, required.len()),
+            index + 1,
+            required.len(),
+            42 + (((index + 1) * 20) / required.len()) as u8,
+        );
+    }
+    if !untagged_versions.is_empty() {
+        let shown = untagged_versions
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>();
+        let names = if untagged_versions.len() > shown.len() {
+            format!(
+                "{}, and {} more",
+                shown.join(", "),
+                untagged_versions.len() - shown.len()
+            )
+        } else {
+            shown.join(", ")
+        };
+        warnings.push(format!(
+            "CurseForge marks the pinned files as client-compatible, but does not list Minecraft {} for: {}. The pack's exact pinned files were kept; check the game for compatibility issues.",
+            manifest.minecraft.version, names
+        ));
+    }
+    Ok(resolved)
+}
+
+fn install_curseforge_file(
+    client: &Client,
+    profile_dir: &Path,
+    file: &ResolvedCurseForgeFile,
+) -> Result<(), String> {
+    let destination = safe_join(profile_dir, &file.relative_path)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("Invalid destination for {}.", file.file_name))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not prepare {}: {error}", file.relative_path))?;
+    let temporary = parent.join(format!(
+        ".bee-curseforge-{}-{}.download",
+        file.project_id, file.file_id
+    ));
+    let result = (|| {
+        let mut response = client
+            .get(&file.download_url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| format!("Could not download {}: {error}", file.file_name))?;
+        let url = response.url();
+        if url.scheme() != "https"
+            || !matches!(
+                url.host_str(),
+                Some("www.curseforge.com" | "mediafilez.forgecdn.net" | "edge.forgecdn.net")
+            )
+        {
+            return Err(format!(
+                "CurseForge file {} redirected to an untrusted download host.",
+                file.file_id
+            ));
+        }
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Could not stage {}: {error}", file.file_name))?;
+        let mut output = output;
+        let bytes = io::copy(
+            &mut response.by_ref().take(file.file_length.saturating_add(1)),
+            &mut output,
+        )
+        .map_err(|error| format!("Could not save {}: {error}", file.file_name))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("Could not finish saving {}: {error}", file.file_name))?;
+        if bytes != file.file_length {
+            return Err(format!(
+                "CurseForge file {} had {} bytes; expected {}.",
+                file.file_id, bytes, file.file_length
+            ));
+        }
+        if destination.exists() {
+            if !files_have_same_bytes(&temporary, &destination).map_err(|error| {
+                format!("Could not compare the existing {}: {error}", file.file_name)
+            })? {
+                return Err(format!(
+                    "The profile already contains a different file named {}; it was not replaced.",
+                    file.file_name
+                ));
+            }
+            fs::remove_file(&temporary).map_err(|error| {
+                format!("Could not finish checking {}: {error}", file.file_name)
+            })?;
+        } else {
+            fs::rename(&temporary, &destination)
+                .map_err(|error| format!("Could not install {}: {error}", file.file_name))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn install_curseforge_files(
+    app: &AppHandle,
+    client: &Client,
+    profile_dir: &Path,
+    files: &[ResolvedCurseForgeFile],
+) -> Result<usize, String> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let queue = Mutex::new(VecDeque::from(files.to_vec()));
+    let completed = AtomicUsize::new(0);
+    let failure = Mutex::new(None::<String>);
+    let worker_count = files.len().min(4);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let client = client.clone();
+            let queue = &queue;
+            let completed = &completed;
+            let failure = &failure;
+            let profile_dir = profile_dir.to_path_buf();
+            let app = app.clone();
+            scope.spawn(move || loop {
+                let file = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some(file) = file else { break };
+                if let Err(error) = install_curseforge_file(&client, &profile_dir, &file) {
+                    if let Ok(mut first_error) = failure.lock() {
+                        if first_error.is_none() {
+                            *first_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+                let count = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                report_progress(
+                    &app,
+                    "dependencies",
+                    format!("Installed {}", file.file_name),
+                    count,
+                    files.len(),
+                    64 + ((count * 30) / files.len()) as u8,
+                );
+            });
+        }
+    });
+    if let Some(error) = failure.into_inner().unwrap_or(None) {
+        return Err(error);
+    }
+    Ok(files.len())
 }
 
 fn local_bundle_entries(
@@ -2021,6 +2842,8 @@ pub(super) fn installed_profiles(app: &AppHandle) -> Vec<InstalledVersion> {
     let Ok(entries) = fs::read_dir(instances) else {
         return Vec::new();
     };
+    let shared_dir = app_shared_game_files_dir(app).ok();
+    let _store_guard = SHARED_GAME_FILES_LOCK.lock().ok();
     let mut profiles = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -2032,6 +2855,11 @@ pub(super) fn installed_profiles(app: &AppHandle) -> Vec<InstalledVersion> {
         };
         if marker.instance_id != entry.file_name().to_string_lossy() {
             continue;
+        }
+        if let Some(shared_dir) = shared_dir.as_deref() {
+            // Older releases stored these immutable game files in each pack. Merge only
+            // byte-identical paths; on conflicts, keep the original profile untouched.
+            let _ = ensure_profile_shared_game_files(&path, shared_dir);
         }
         for mut profile in super::installed_versions(&path) {
             if profile.id != marker.profile_id {
@@ -2078,6 +2906,13 @@ pub(super) fn resolve_profile(
                     "That modpack profile key does not match its installed instance.".to_string(),
                 );
             }
+            if let Ok(shared_dir) = app_shared_game_files_dir(app) {
+                if let Ok(_guard) = SHARED_GAME_FILES_LOCK.lock() {
+                    // A collision in an older profile is non-destructive: that profile
+                    // continues using its local runtime while new imports share the store.
+                    let _ = ensure_profile_shared_game_files(&instance_dir, &shared_dir);
+                }
+            }
             if !super::metadata_at(&instance_dir, version_id).is_some() {
                 return Err("That modpack's Minecraft profile files are incomplete.".to_string());
             }
@@ -2096,85 +2931,149 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
-    let is_bundle = extension.eq_ignore_ascii_case("zip");
-    if !is_bundle && !extension.eq_ignore_ascii_case("mrpack") {
-        return Err("Choose a Modrinth .mrpack file or a Bee Launcher bundle ZIP.".to_string());
+    let is_zip = extension.eq_ignore_ascii_case("zip");
+    if !is_zip && !extension.eq_ignore_ascii_case("mrpack") {
+        return Err(
+            "Choose a Modrinth .mrpack file or a Modrinth/CurseForge ZIP export.".to_string(),
+        );
     }
     report_progress(app, "validate", "Reading modpack manifest", 0, 1, 2);
-    let manifest = read_manifest(&pack_path)?;
-    let (minecraft_version, loader) = validate_manifest(&manifest)?;
-    let local_entries = local_bundle_entries(&pack_path, &manifest.files)?;
-    let client_file_count = manifest
-        .files
-        .iter()
-        .filter(|file| {
-            file.env
-                .as_ref()
-                .and_then(|environment| environment.client.as_deref())
-                != Some("unsupported")
-        })
-        .count();
-    if is_bundle && local_entries.len() < client_file_count {
-        return Err("This ZIP does not contain every client mod listed in its Modrinth manifest. Choose the Bee Launcher bundle ZIP or the original .mrpack instead.".to_string());
+    let manifest = read_any_manifest(&pack_path)?;
+    let (details, is_curseforge) = match &manifest {
+        PackManifest::Modrinth(manifest) => {
+            let (minecraft_version, loader) = validate_manifest(manifest)?;
+            (
+                PackDetails {
+                    name: manifest.name.clone(),
+                    version: manifest.version_id.clone(),
+                    minecraft_version,
+                    loader,
+                    recommended_ram_mb: None,
+                },
+                false,
+            )
+        }
+        PackManifest::CurseForge(manifest) => (validate_curseforge_manifest(manifest)?, true),
+    };
+    let is_bundle = is_zip && !is_curseforge;
+    let local_entries = if let PackManifest::Modrinth(manifest) = &manifest {
+        if is_bundle {
+            local_bundle_entries(&pack_path, &manifest.files)?
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+    if let PackManifest::Modrinth(manifest) = &manifest {
+        let client_file_count = manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.env
+                    .as_ref()
+                    .and_then(|environment| environment.client.as_deref())
+                    != Some("unsupported")
+            })
+            .count();
+        if is_bundle && local_entries.len() < client_file_count {
+            return Err("This Bee ZIP does not contain every client mod listed in its Modrinth manifest. Choose the original .mrpack or a complete Bee bundle instead.".to_string());
+        }
     }
-    let installed_game_dir = if is_bundle {
+    let installed_game_dir = if is_bundle || is_curseforge {
         Some(super::resolve_game_dir(app)?)
     } else {
         None
     };
     let instances = app_instances_dir(app)?;
-    let (instance_id, instance_dir) = allocate_instance_dir(&instances, &manifest.name)?;
+    let (instance_id, instance_dir) = allocate_instance_dir(&instances, &details.name)?;
+    let _store_guard = SHARED_GAME_FILES_LOCK
+        .lock()
+        .map_err(|_| "The shared Minecraft file store is temporarily unavailable.".to_string())?;
+    let common_dir = app_shared_game_files_dir(app)?;
+    let mut warnings = Vec::new();
     let result = (|| {
         report_progress(
             app,
             "validate",
-            format!("Preparing {} as a separate instance", manifest.name),
+            format!("Preparing {} as a separate profile", details.name),
             1,
             1,
             6,
         );
         copy_overrides(&pack_path, &instance_dir, app)?;
         let client = downloader()?;
-        let profile_id = if let Some(source_game_dir) = installed_game_dir.as_deref() {
+        let reusable = installed_game_dir.as_deref().and_then(|source_game_dir| {
+            find_installed_pack_profile(
+                source_game_dir,
+                &details.minecraft_version,
+                details.loader.as_ref(),
+            )
+            .ok()
+            .map(|(profile_id, chain)| (source_game_dir, profile_id, chain))
+        });
+        if is_bundle && reusable.is_none() {
+            let loader = details
+                .loader
+                .as_ref()
+                .map(|loader| format!(" with {} {}", loader.kind.label(), loader.version))
+                .unwrap_or_default();
+            return Err(format!(
+                "This Bee ZIP needs Minecraft {}{loader}, but that profile is not installed in the selected .minecraft folder. Install and launch it once, then retry.",
+                details.minecraft_version
+            ));
+        }
+        let profile_id = if let Some((source_game_dir, profile_id, source_chain)) = reusable {
             report_progress(
                 app,
                 "minecraft",
-                format!("Finding installed Minecraft {minecraft_version} profile"),
+                format!(
+                    "Reusing matching Minecraft {} files",
+                    details.minecraft_version
+                ),
                 0,
                 1,
                 15,
             );
-            let (profile_id, source_chain) =
-                find_installed_pack_profile(source_game_dir, &minecraft_version, loader.as_ref())?;
-            copy_installed_profile(source_game_dir, &instance_dir, &source_chain)?;
-            let chain = super::metadata_chain(&instance_dir, &profile_id)?;
+            copy_installed_profile(source_game_dir, &common_dir, &source_chain)?;
+            let chain = super::metadata_chain(&common_dir, &profile_id)?;
             report_progress(
                 app,
                 "minecraft",
-                format!("Reusing installed {profile_id} profile and libraries"),
+                format!("Sharing installed {profile_id} profile and libraries"),
                 0,
                 1,
                 25,
             );
-            copy_installed_libraries(source_game_dir, &instance_dir, &chain)?;
-            let _ = super::install_bundled_authlib(&instance_dir, &chain)?;
-            copy_installed_assets(Some(app), source_game_dir, &instance_dir, &chain)?;
+            copy_installed_libraries(source_game_dir, &common_dir, &chain)?;
+            let _ = super::install_bundled_authlib(&common_dir, &chain)?;
+            copy_installed_assets(Some(app), source_game_dir, &common_dir, &chain)?;
             report_progress(
                 app,
                 "minecraft",
-                "Installed Minecraft profile and runtime reused",
+                "Minecraft files added to the shared store",
                 1,
                 1,
-                74,
+                52,
             );
             profile_id
         } else {
+            if is_curseforge {
+                report_progress(
+                    app,
+                    "minecraft",
+                    "No matching local Minecraft profile; preparing it online",
+                    0,
+                    1,
+                    15,
+                );
+            }
             let profile_id = install_version_metadata(
                 Some(app),
                 &client,
-                &instance_dir,
-                &minecraft_version,
-                loader.as_ref(),
+                &common_dir,
+                &details.minecraft_version,
+                details.loader.as_ref(),
             )?;
             report_progress(
                 app,
@@ -2182,44 +3081,56 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 "Preparing Minecraft client and libraries",
                 0,
                 1,
-                25,
+                30,
             );
-            let chain = super::metadata_chain(&instance_dir, &profile_id)?;
-            super::ensure_client_jar(&client, &instance_dir, &chain)?;
-            super::ensure_library_artifacts(&client, &instance_dir, &chain)?;
-            let _ = super::install_bundled_authlib(&instance_dir, &chain)?;
+            let chain = super::metadata_chain(&common_dir, &profile_id)?;
+            super::ensure_client_jar(&client, &common_dir, &chain)?;
+            super::ensure_library_artifacts(&client, &common_dir, &chain)?;
+            let _ = super::install_bundled_authlib(&common_dir, &chain)?;
             report_progress(
                 app,
                 "minecraft",
                 "Minecraft client and libraries are ready",
                 1,
                 1,
-                50,
+                48,
             );
-            install_assets(app, &client, &instance_dir, &chain)?;
+            install_assets(app, &client, &common_dir, &chain)?;
             profile_id
         };
-        let installed_files = install_pack_files(
-            app,
-            &client,
-            &instance_dir,
-            &manifest.files,
-            &pack_path,
-            &local_entries,
-            is_bundle,
-        )?;
+        ensure_profile_shared_game_files(&instance_dir, &common_dir)?;
+        let installed_files = match &manifest {
+            PackManifest::Modrinth(manifest) => install_pack_files(
+                app,
+                &client,
+                &instance_dir,
+                &manifest.files,
+                &pack_path,
+                &local_entries,
+                is_bundle,
+            )?,
+            PackManifest::CurseForge(manifest) => {
+                let files =
+                    resolve_curseforge_files(app, &client, &pack_path, manifest, &mut warnings)?;
+                install_curseforge_files(app, &client, &instance_dir, &files)?
+            }
+        };
         let marker = InstanceMarker {
             instance_id: instance_id.clone(),
-            name: manifest.name.clone(),
-            minecraft_version: minecraft_version.clone(),
-            loader_name: loader.as_ref().map(|item| item.kind.label().to_string()),
-            loader_version: loader.as_ref().map(|item| item.version.clone()),
-            fabric_loader: loader
+            name: details.name.clone(),
+            minecraft_version: details.minecraft_version.clone(),
+            loader_name: details
+                .loader
+                .as_ref()
+                .map(|item| item.kind.label().to_string()),
+            loader_version: details.loader.as_ref().map(|item| item.version.clone()),
+            fabric_loader: details
+                .loader
                 .as_ref()
                 .filter(|item| item.kind == LoaderKind::Fabric)
                 .map(|item| item.version.clone()),
             profile_id: profile_id.clone(),
-            pack_version: manifest.version_id.clone(),
+            pack_version: details.version.clone(),
         };
         let marker_path = instance_dir.join(".bee-instance.json");
         let marker_bytes = serde_json::to_vec_pretty(&marker)
@@ -2229,22 +3140,43 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
         report_progress(
             app,
             "complete",
-            format!("{} installed successfully", manifest.name),
+            format!("{} installed successfully", details.name),
             installed_files,
             installed_files,
             100,
         );
         Ok(ImportResult {
-            instance_name: manifest.name.clone(),
+            instance_name: details.name.clone(),
             profile_key: format!("pack:{instance_id}:{profile_id}"),
-            minecraft_version: minecraft_version.clone(),
-            loader_name: loader.as_ref().map(|item| item.kind.label().to_string()),
-            loader_version: loader.as_ref().map(|item| item.version.clone()),
+            minecraft_version: details.minecraft_version.clone(),
+            loader_name: details
+                .loader
+                .as_ref()
+                .map(|item| item.kind.label().to_string()),
+            loader_version: details.loader.as_ref().map(|item| item.version.clone()),
             files_installed: installed_files,
+            warnings: warnings.clone(),
         })
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&instance_dir);
+    }
+    if result.is_ok() {
+        if let Some(ram_mb) = details.recommended_ram_mb {
+            let profile_key = result
+                .as_ref()
+                .expect("checked successful result")
+                .profile_key
+                .clone();
+            let mut settings = super::read_stored_settings(app);
+            let recommended_gb = (ram_mb.saturating_add(1023) / 1024).clamp(1, 64) as u8;
+            settings
+                .profile_settings
+                .entry(profile_key)
+                .or_default()
+                .max_memory_gb = Some(recommended_gb);
+            let _ = super::write_stored_settings(app, &settings);
+        }
     }
     result
 }
@@ -2274,6 +3206,170 @@ mod tests {
     fn format_v1_manifest(loader: Option<(&str, &str)>) -> ModrinthManifest {
         serde_json::from_value(format_v1_manifest_value(loader))
             .expect("fixture should match the Modrinth format-v1 manifest")
+    }
+
+    fn curseforge_fixture_value() -> Value {
+        serde_json::json!({
+            "manifestType": "minecraftModpack",
+            "manifestVersion": 1,
+            "name": "Satisfaction Guaranteed",
+            "version": "1.2.1",
+            "minecraft": {
+                "version": "26.3",
+                "modLoaders": [{"id": "fabric-0.20.1", "primary": true}],
+                "recommendedRam": 6016
+            },
+            "files": [
+                {"projectID": 10, "fileID": 101, "required": true},
+                {"projectID": 11, "fileID": 102, "required": true},
+                {"projectID": 12, "fileID": 103, "required": false}
+            ],
+            "overrides": "overrides"
+        })
+    }
+
+    #[test]
+    fn validates_curseforge_loader_pin_and_recommended_memory() {
+        let manifest: CurseForgeManifest = serde_json::from_value(curseforge_fixture_value())
+            .expect("CurseForge fixture should deserialize");
+        let details = validate_curseforge_manifest(&manifest)
+            .expect("supported CurseForge manifest should validate");
+        assert_eq!(details.name, "Satisfaction Guaranteed");
+        assert_eq!(details.version.as_deref(), Some("1.2.1"));
+        assert_eq!(details.minecraft_version, "26.3");
+        assert_eq!(details.recommended_ram_mb, Some(6016));
+        assert_eq!(
+            details.loader,
+            Some(LoaderPin {
+                kind: LoaderKind::Fabric,
+                version: "0.20.1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn classifies_curseforge_mods_texture_packs_and_shaders_in_manifest_order() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let pack = std::env::temp_dir().join(format!("bee-curseforge-categories-{unique}.zip"));
+        let file = fs::File::create(&pack).expect("fixture archive should be created");
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .expect("manifest entry should open");
+        archive
+            .write_all(
+                &serde_json::to_vec(&curseforge_fixture_value()).expect("manifest should encode"),
+            )
+            .expect("manifest should be written");
+        archive
+            .start_file("modlist.html", zip::write::SimpleFileOptions::default())
+            .expect("mod list entry should open");
+        archive
+            .write_all(
+                b"<ul><li><a href=\"https://www.curseforge.com/minecraft/mc-mods/mod-a\">A</a></li><li><a href=\"https://www.curseforge.com/minecraft/texture-packs/pack-b\">B</a></li><li><a href=\"https://www.curseforge.com/minecraft/shaders/shader-c\">C</a></li></ul>",
+            )
+            .expect("mod list should be written");
+        archive.finish().expect("fixture archive should close");
+        let parsed = read_any_manifest(&pack).expect("CurseForge ZIP should parse");
+        assert!(matches!(parsed, PackManifest::CurseForge(_)));
+        assert_eq!(
+            curseforge_destinations(&pack, 3).expect("all file types should be found"),
+            vec![
+                CurseForgeDestination::Mods,
+                CurseForgeDestination::Resourcepacks,
+                CurseForgeDestination::Shaderpacks
+            ]
+        );
+        fs::remove_file(pack).expect("fixture archive should be removed");
+    }
+
+    #[test]
+    fn shared_store_migration_keeps_mutable_profile_files_local() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-shared-game-files-{unique}"));
+        let profile = root.join("instances/outbreak");
+        let common = root.join("minecraft-common");
+        fs::create_dir_all(profile.join("assets/objects/aa")).expect("profile assets should exist");
+        fs::create_dir_all(profile.join("libraries/example"))
+            .expect("profile libraries should exist");
+        fs::create_dir_all(profile.join("versions/fabric-test"))
+            .expect("profile versions should exist");
+        fs::create_dir_all(profile.join("mods")).expect("profile mods should exist");
+        fs::create_dir_all(profile.join("config")).expect("profile config should exist");
+        fs::create_dir_all(profile.join("saves/world")).expect("profile saves should exist");
+        fs::create_dir_all(common.join("assets/objects/aa")).expect("shared assets should exist");
+        fs::write(profile.join("assets/objects/aa/hash"), b"asset")
+            .expect("asset should be written");
+        fs::write(profile.join("libraries/example/library.jar"), b"library")
+            .expect("library should be written");
+        fs::write(
+            profile.join("versions/fabric-test/profile.json"),
+            b"metadata",
+        )
+        .expect("version metadata should be written");
+        fs::write(profile.join("mods/outbreak.jar"), b"outbreak only")
+            .expect("mod should be written");
+        fs::write(profile.join("config/outbreak.json"), b"profile config")
+            .expect("config should be written");
+        fs::write(profile.join("saves/world/level.dat"), b"world").expect("save should be written");
+        fs::write(common.join("assets/objects/aa/hash"), b"asset")
+            .expect("shared copy should be written");
+
+        ensure_profile_shared_game_files(&profile, &common)
+            .expect("profile should link to shared files");
+        for folder in ["assets", "libraries", "versions"] {
+            assert!(is_linked_to(&profile.join(folder), &common.join(folder)));
+        }
+        assert_eq!(
+            fs::read(profile.join("mods/outbreak.jar")).unwrap(),
+            b"outbreak only"
+        );
+        assert_eq!(
+            fs::read(profile.join("config/outbreak.json")).unwrap(),
+            b"profile config"
+        );
+        assert_eq!(
+            fs::read(profile.join("saves/world/level.dat")).unwrap(),
+            b"world"
+        );
+        assert!(!profile.join(".assets.bee-local-backup").exists());
+        fs::remove_dir_all(root).expect("fixture tree should be removed");
+    }
+
+    #[test]
+    fn shared_store_conflict_does_not_replace_existing_profile_or_shared_files() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-shared-game-conflict-{unique}"));
+        let profile = root.join("instances/smallhold");
+        let common = root.join("minecraft-common");
+        fs::create_dir_all(profile.join("versions")).expect("profile versions should exist");
+        fs::create_dir_all(common.join("versions")).expect("shared versions should exist");
+        fs::write(profile.join("versions/version.json"), b"profile version")
+            .expect("profile version should be written");
+        fs::write(common.join("versions/version.json"), b"shared version")
+            .expect("shared version should be written");
+        let error = ensure_profile_shared_game_files(&profile, &common)
+            .expect_err("conflicting version metadata must not be merged");
+        assert!(error.contains("left intact"));
+        assert_eq!(
+            fs::read(profile.join("versions/version.json")).unwrap(),
+            b"profile version"
+        );
+        assert_eq!(
+            fs::read(common.join("versions/version.json")).unwrap(),
+            b"shared version"
+        );
+        assert!(profile.join("versions").is_dir());
+        fs::remove_dir_all(root).expect("fixture tree should be removed");
     }
 
     #[test]

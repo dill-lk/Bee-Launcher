@@ -2531,11 +2531,15 @@ fn classpath_and_extract_natives(
     }
 
     let profile_dir = game_dir.join("versions").join(version_id);
-    let existing_native_dir = profile_dir.join("natives");
-    let native_dir = if existing_native_dir.is_dir() {
-        existing_native_dir
+    let native_dir = if game_dir.join(".bee-instance.json").is_file() {
+        game_dir.join("native-libraries").join(version_id)
     } else {
-        profile_dir.join(format!("{version_id}-natives"))
+        let existing_native_dir = profile_dir.join("natives");
+        if existing_native_dir.is_dir() {
+            existing_native_dir
+        } else {
+            profile_dir.join(format!("{version_id}-natives"))
+        }
     };
     fs::create_dir_all(&native_dir)
         .map_err(|error| format!("Could not create the local Java native folder: {error}"))?;

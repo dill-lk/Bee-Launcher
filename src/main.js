@@ -55,10 +55,18 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.32', date: '2026-11-13', title: 'CurseForge packs and shared game files',
+    changes: [
+      'Imports CurseForge ZIP exports directly, including the supplied Satisfaction Guaranteed pack, and resolves its pinned files from CurseForge.',
+      'Shares common Minecraft assets, libraries, and version files across imported profiles while keeping mods, configs, resource packs, shaders, saves, and launch options profile-local.',
+      'Existing imported profiles are migrated only when common files match; conflicting files stay in their original profile. The selected .minecraft folder is copied from, never linked or rewritten.',
+    ],
+  },
+  {
     version: '0.1.31', date: '2026-11-12', title: 'Forge, NeoForge, and Quilt modpack imports',
     changes: [
       'Imports Modrinth format-v1 vanilla, Fabric, Quilt, Forge, and NeoForge packs as isolated profiles; Forge and NeoForge use their official client installers inside the new pack folder.',
-      'Bee ZIP imports remain offline and reuse a matching Minecraft/loader profile already installed locally; CurseForge ZIP archives, future/custom loader dependencies, and packs pinning multiple loaders are not supported.',
+      'Bee ZIP imports remain offline and reuse a matching Minecraft/loader profile already installed locally. CurseForge ZIP imports resolve the exact project/file IDs over HTTPS and support one pinned loader.',
     ],
   },
   {
@@ -433,7 +441,7 @@ function renderImportedPacks() {
   if (!list) return;
   const profiles = (appStatus.installedVersions || []).filter((profile) => profile.instanceName);
   if (!profiles.length) {
-    list.innerHTML = '<div class="item"><span class="dot" style="background:#ffcf4a"></span><div><b>No imported packs yet</b><small>Choose a Modrinth .mrpack or Bee Launcher ZIP to install one.</small></div></div>';
+    list.innerHTML = '<div class="item"><span class="dot" style="background:#ffcf4a"></span><div><b>No imported packs yet</b><small>Choose a Modrinth .mrpack, CurseForge ZIP, or Bee Launcher ZIP to install one.</small></div></div>';
     return;
   }
   list.innerHTML = profiles.map((profile) => {
@@ -668,13 +676,13 @@ function openPanel(name, title = '') {
     $('#choose-folder-modal').addEventListener('click', pickGameFolder);
     $('#import-modpack-from-inst').addEventListener('click', () => openPanel('mods'));
   } else if (name === 'mods') {
-    sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or Bee Launcher ZIP')}
+    sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or CurseForge ZIP')}
       <div class="panel-scroll">
-      <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>The pack gets its own game folder. Your existing .minecraft mods, configs, and saves stay untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose .mrpack or ZIP</button>
-        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">Modrinth packs may download game files and loader components; Bee ZIPs reuse files already installed locally.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
+      <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>Each profile keeps its own mods, configs, resource packs, shaders, saves, and options. Common Minecraft assets, libraries, and version files are shared to save disk space. Your selected .minecraft folder stays untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose modpack file</button>
+        <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">Modrinth and CurseForge imports may download game files and loader components; Bee ZIPs reuse a matching local profile.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>Modrinth format-v1 packs with vanilla, Fabric, Quilt, Forge, or NeoForge are supported. Forge/NeoForge installs need internet and a compatible Java runtime. Bee ZIPs work offline only when the matching Minecraft/loader profile is already installed and the ZIP contains every client mod. CurseForge ZIP archives, future/custom loader IDs, other archive formats, and packs pinning multiple loaders are not supported. Imported mod files are checked against their manifest hashes.</span></div>
+      <div class="local-note"><span class="note-mark">i</span><span>Modrinth format-v1 and CurseForge Minecraft modpack ZIPs support vanilla, Fabric, Quilt, Forge, or NeoForge with one loader per pack. CurseForge imports fetch exact pinned files over HTTPS; Bee ZIP bundles remain offline and need a matching profile plus every listed client file inside the ZIP. Mods, configs, resource packs, shaders, saves, and options stay profile-local; common game files are reused from Bee's shared store. Modrinth downloads are checked against manifest hashes; CurseForge downloads are checked against the pinned file IDs and file sizes.</span></div>
       <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>
       </div>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);
@@ -1080,8 +1088,8 @@ async function pickModpack() {
     const selected = await open({
       directory: false,
       multiple: false,
-      title: 'Choose a Modrinth .mrpack or Bee Launcher ZIP',
-      filters: [{ name: 'Modrinth modpack or Bee Launcher bundle', extensions: ['mrpack', 'zip'] }],
+      title: 'Choose a Modrinth .mrpack or CurseForge ZIP',
+      filters: [{ name: 'Minecraft modpack', extensions: ['mrpack', 'zip'] }],
     });
     if (selected) await installModpack(selected);
   } catch (error) {
@@ -1101,7 +1109,7 @@ async function installModpack(path) {
   const progressBar = $('#modpack-progress-bar');
   const progressDetail = $('#modpack-progress-detail');
   if (progress) progress.hidden = false;
-  if (progressTitle) progressTitle.textContent = 'Preparing separate instance…';
+  if (progressTitle) progressTitle.textContent = 'Preparing separate profile…';
   if (progressMessage) progressMessage.textContent = 'Validating the pack and checking the pinned game version.';
   if (progressBar) progressBar.value = 0;
   if (progressDetail) progressDetail.textContent = '0%';
@@ -1117,11 +1125,12 @@ async function installModpack(path) {
     selectedVersion = result.profileKey;
     appStatus = await invoke('app_status');
     renderStatus();
+    const importWarnings = Array.isArray(result.warnings) ? result.warnings : [];
     if (progressTitle) progressTitle.textContent = 'Modpack installed';
-    if (progressMessage) progressMessage.textContent = `${result.instanceName} · Minecraft ${result.minecraftVersion}${result.loaderName ? ` · ${result.loaderName} ${result.loaderVersion}` : ' · Vanilla'}`;
+    if (progressMessage) progressMessage.textContent = `${result.instanceName} · Minecraft ${result.minecraftVersion}${result.loaderName ? ` · ${result.loaderName} ${result.loaderVersion}` : ' · Vanilla'}${importWarnings.length ? ` · Compatibility note: ${importWarnings.join(' ')}` : ''}`;
     if (progressBar) progressBar.value = 100;
-    if (progressDetail) progressDetail.textContent = `${result.filesInstalled} mod files verified`;
-    notify(`${result.instanceName} imported as a separate profile.`, 7500);
+    if (progressDetail) progressDetail.textContent = `${result.filesInstalled} pack files installed`;
+    notify(importWarnings.length ? `${result.instanceName} imported. ${importWarnings.join(' ')}` : `${result.instanceName} imported as a separate profile.`, importWarnings.length ? 15000 : 7500);
   } catch (error) {
     if (progressTitle) progressTitle.textContent = 'Import could not finish';
     if (progressMessage) progressMessage.textContent = String(error);
