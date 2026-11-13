@@ -864,8 +864,9 @@ fn save_profile_launch_settings(
     ) {
         return Err("That graphics preset is not supported.".to_string());
     }
-    let (profile_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
-    let chain = metadata_chain(&profile_dir, &version_id)?;
+    let (_, version_id) = modpack::resolve_profile(&app, &profile_key)?;
+    let base_dir = modpack::resolve_profile_base(&app, &profile_key)?;
+    let chain = metadata_chain(&base_dir, &version_id)?;
     let required_major = chain
         .iter()
         .find_map(|(_, metadata)| required_java_major(metadata));
@@ -1198,8 +1199,12 @@ fn installed_custom_skin_loader_version(game_dir: &Path) -> Option<String> {
     versions.into_iter().next().map(|(_, version)| version)
 }
 
-fn custom_skin_support_for_profile(game_dir: &Path, version_id: &str) -> CustomSkinSupport {
-    let Some(profile) = installed_versions(game_dir)
+fn custom_skin_support_for_profile(
+    game_dir: &Path,
+    base_dir: &Path,
+    version_id: &str,
+) -> CustomSkinSupport {
+    let Some(profile) = installed_versions(base_dir)
         .into_iter()
         .find(|profile| profile.id == version_id)
     else {
@@ -1528,7 +1533,12 @@ fn get_custom_skin_support(
     profile_key: String,
 ) -> Result<CustomSkinSupport, String> {
     let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
-    Ok(custom_skin_support_for_profile(&game_dir, &version_id))
+    let base_dir = modpack::resolve_profile_base(&app, &profile_key)?;
+    Ok(custom_skin_support_for_profile(
+        &game_dir,
+        &base_dir,
+        &version_id,
+    ))
 }
 
 #[tauri::command]
@@ -1540,7 +1550,8 @@ fn apply_custom_skin_to_profile(
 ) -> Result<SkinApplyResult, String> {
     validate_username(&username)?;
     let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
-    let support = custom_skin_support_for_profile(&game_dir, &version_id);
+    let base_dir = modpack::resolve_profile_base(&app, &profile_key)?;
+    let support = custom_skin_support_for_profile(&game_dir, &base_dir, &version_id);
     if !support.supported {
         return Err(support.reason);
     }
@@ -2325,19 +2336,68 @@ fn install_bundled_authlib(
     Ok(Some(destination))
 }
 
-fn add_classpath_path(
-    game_dir: &Path,
+fn local_runtime_artifact(
+    base_dir: &Path,
+    profile_dir: &Path,
+    spec: &ArtifactSpec,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let base_path = safe_join(base_dir, &spec.relative_path)?;
+    if local_file_is_usable(&base_path) {
+        return Ok(base_path);
+    }
+    let profile_path = safe_join(profile_dir, &spec.relative_path)?;
+    if profile_path != base_path && local_file_is_usable(&profile_path) {
+        return Ok(profile_path);
+    }
+    let path = if base_path.exists() {
+        base_path
+    } else {
+        profile_path
+    };
+    let reason = if path.exists() {
+        "is present but is not a usable non-empty file"
+    } else {
+        "is missing"
+    };
+    Err(format!(
+        "Required local Minecraft {label} {reason}: {}. Bee will not download into the selected .minecraft folder.",
+        path.display()
+    ))
+}
+
+fn local_file_is_usable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+fn local_runtime_file(
+    base_dir: &Path,
+    profile_dir: &Path,
     relative: &str,
+) -> Result<PathBuf, String> {
+    let base_path = safe_join(base_dir, relative)?;
+    if local_file_is_usable(&base_path) {
+        return Ok(base_path);
+    }
+    let profile_path = safe_join(profile_dir, relative)?;
+    if local_file_is_usable(&profile_path) {
+        return Ok(profile_path);
+    }
+    Err(format!(
+        "A required local Minecraft file is missing from the selected base and Bee profile: {}",
+        base_path.display()
+    ))
+}
+
+fn add_classpath_path(
+    base_dir: &Path,
+    profile_dir: &Path,
+    spec: &ArtifactSpec,
+    label: &str,
     paths: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) -> Result<(), String> {
-    let path = safe_join(game_dir, relative)?;
-    if !path.is_file() {
-        return Err(format!(
-            "A required Minecraft library is missing after preparation: {}",
-            path.display()
-        ));
-    }
+    let path = local_runtime_artifact(base_dir, profile_dir, spec, label)?;
     let text = path.to_string_lossy().into_owned();
     if seen.insert(text.clone()) {
         paths.push(text);
@@ -2448,7 +2508,8 @@ fn native_files_exist(directory: &Path) -> bool {
 }
 
 fn classpath_and_extract_natives(
-    game_dir: &Path,
+    base_dir: &Path,
+    profile_dir: &Path,
     version_id: &str,
     chain: &[(String, Value)],
 ) -> Result<(String, PathBuf), String> {
@@ -2474,13 +2535,12 @@ fn classpath_and_extract_natives(
                     let spec = library_artifact_spec(library).ok_or_else(|| {
                         format!("Native library {name} has no usable local artifact path.")
                     })?;
-                    let path = safe_join(game_dir, &spec.relative_path)?;
-                    if !path.is_file() {
-                        return Err(format!(
-                            "Required native library is missing after preparation: {}",
-                            path.display()
-                        ));
-                    }
+                    let path = local_runtime_artifact(
+                        base_dir,
+                        profile_dir,
+                        &spec,
+                        &format!("native library {name}"),
+                    )?;
                     if native_seen.insert(path.clone()) {
                         native_archives.push((path, Vec::new()));
                     }
@@ -2488,7 +2548,7 @@ fn classpath_and_extract_natives(
                 continue;
             }
             if let Some(spec) = library_artifact_spec(library) {
-                add_classpath_path(game_dir, &spec.relative_path, &mut paths, &mut seen)?;
+                add_classpath_path(base_dir, profile_dir, &spec, name, &mut paths, &mut seen)?;
             }
 
             if let Some((classifier, excluded)) = native_classifier(library) {
@@ -2499,13 +2559,12 @@ fn classpath_and_extract_natives(
                     let spec = artifact_spec(artifact, None, None).ok_or_else(|| {
                         format!("Native classifier {classifier} has incomplete metadata.")
                     })?;
-                    let path = safe_join(game_dir, &spec.relative_path)?;
-                    if !path.is_file() {
-                        return Err(format!(
-                            "Required native library is missing after preparation: {}",
-                            path.display()
-                        ));
-                    }
+                    let path = local_runtime_artifact(
+                        base_dir,
+                        profile_dir,
+                        &spec,
+                        &format!("native library {classifier}"),
+                    )?;
                     if native_seen.insert(path.clone()) {
                         native_archives.push((path, excluded));
                     }
@@ -2514,13 +2573,7 @@ fn classpath_and_extract_natives(
                     let base = coordinate.split(':').take(3).collect::<Vec<_>>().join(":");
                     let native_name = format!("{base}:{classifier}");
                     if let Some(relative) = coordinate_path(&native_name) {
-                        let path = safe_join(game_dir, &relative)?;
-                        if !path.is_file() {
-                            return Err(format!(
-                                "Required native library is missing after preparation: {}",
-                                path.display()
-                            ));
-                        }
+                        let path = local_runtime_file(base_dir, profile_dir, &relative)?;
                         if native_seen.insert(path.clone()) {
                             native_archives.push((path, excluded));
                         }
@@ -2530,15 +2583,16 @@ fn classpath_and_extract_natives(
         }
     }
 
-    let profile_dir = game_dir.join("versions").join(version_id);
-    let native_dir = if game_dir.join(".bee-instance.json").is_file() {
-        game_dir.join("native-libraries").join(version_id)
+    let version_dir = base_dir.join("versions").join(version_id);
+    let native_dir = if profile_dir.join(".bee-instance.json").is_file() || base_dir != profile_dir
+    {
+        profile_dir.join("native-libraries").join(version_id)
     } else {
-        let existing_native_dir = profile_dir.join("natives");
+        let existing_native_dir = version_dir.join("natives");
         if existing_native_dir.is_dir() {
             existing_native_dir
         } else {
-            profile_dir.join(format!("{version_id}-natives"))
+            version_dir.join(format!("{version_id}-natives"))
         }
     };
     fs::create_dir_all(&native_dir)
@@ -2616,14 +2670,15 @@ fn jopt_simple_spec(chain: &[(String, Value)]) -> Option<ArtifactSpec> {
 }
 
 fn include_jopt_simple_classpath(
-    game_dir: &Path,
+    base_dir: &Path,
+    profile_dir: &Path,
     chain: &[(String, Value)],
     library_classpath: &str,
 ) -> Result<(String, Option<PathBuf>), String> {
     let Some(spec) = jopt_simple_spec(chain) else {
         return Ok((library_classpath.to_string(), None));
     };
-    let path = safe_join(game_dir, &spec.relative_path)?;
+    let path = local_runtime_artifact(base_dir, profile_dir, &spec, "jopt-simple support library")?;
     let file = fs::File::open(&path).map_err(|error| {
         format!(
             "Could not open the required jopt-simple library {}: {error}",
@@ -2753,6 +2808,15 @@ fn set_game_option(args: &mut Vec<String>, option: &str, value: String) {
     }
     args.push(option.to_string());
     args.push(value);
+}
+
+fn set_profile_game_directories(args: &mut Vec<String>, game_dir: &Path, base_dir: &Path) {
+    set_game_option(args, "--gameDir", game_dir.to_string_lossy().into_owned());
+    set_game_option(
+        args,
+        "--assetsDir",
+        base_dir.join("assets").to_string_lossy().into_owned(),
+    );
 }
 
 fn log_excerpt(path: &Path) -> String {
@@ -2919,13 +2983,14 @@ fn restore_graphics_baseline(game_dir: &Path, original: Option<&str>) -> Result<
 fn launch_game(
     app: &AppHandle,
     game_dir: &Path,
+    base_dir: &Path,
     version_id: &str,
     profile_key: &str,
     username: &str,
 ) -> Result<LaunchResult, String> {
     ensure_version_id(version_id)?;
     validate_username(username)?;
-    let chain = metadata_chain(game_dir, version_id)?;
+    let chain = metadata_chain(base_dir, version_id)?;
     let java_profile = chain
         .iter()
         .find(|(_, metadata)| required_java_major(metadata).is_some())
@@ -2951,7 +3016,7 @@ fn launch_game(
         }
         java
     } else {
-        find_java_for_profile(game_dir, java_profile).ok_or_else(|| {
+        find_java_for_profile(base_dir, java_profile).ok_or_else(|| {
             required_major.map_or_else(
                 || "A usable Java runtime was not found for this profile.".to_string(),
                 |major| {
@@ -2961,12 +3026,37 @@ fn launch_game(
         })?
     };
     let java = java_for_game_launch(&java_runtime);
-    let http = downloader()?;
-    ensure_client_jar(&http, game_dir, &chain)?;
-    let bundled_authlib_path = install_bundled_authlib(game_dir, &chain)?;
-    ensure_library_artifacts(&http, game_dir, &chain)?;
-    if let Some(spec) = jopt_simple_spec(&chain) {
-        ensure_downloaded(&http, game_dir, &spec, "jopt-simple support library")?;
+    let http = if game_dir == base_dir {
+        Some(downloader()?)
+    } else {
+        None
+    };
+    if let Some(http) = http.as_ref() {
+        ensure_client_jar(http, base_dir, &chain)?;
+    }
+    let bundled_authlib_path = if game_dir != base_dir {
+        if let Some(spec) = bundled_authlib_spec(&chain) {
+            let base_path = safe_join(base_dir, &spec.relative_path)?;
+            if spec.relative_path == BUNDLED_AUTHLIB_PATH
+                && spec.size == Some(BUNDLED_AUTHLIB_SIZE)
+                && spec.sha1.as_deref() == Some(BUNDLED_AUTHLIB_SHA1)
+                && artifact_matches(&base_path, spec.size, spec.sha1.as_deref())
+            {
+                Some(base_path)
+            } else {
+                install_bundled_authlib(game_dir, &chain)?
+            }
+        } else {
+            None
+        }
+    } else {
+        install_bundled_authlib(game_dir, &chain)?
+    };
+    if let Some(http) = http.as_ref() {
+        ensure_library_artifacts(http, base_dir, &chain)?;
+        if let Some(spec) = jopt_simple_spec(&chain) {
+            ensure_downloaded(http, base_dir, &spec, "jopt-simple support library")?;
+        }
     }
     let graphics_restore_key = game_dir.to_string_lossy().into_owned();
     if profile_settings.graphics_preset == "intel-uhd-low" {
@@ -2988,11 +3078,11 @@ fn launch_game(
         restore_graphics_baseline(game_dir, original.as_deref())?;
         write_stored_settings(app, &launch_settings)?;
     }
-    let client_jar = resolve_client_jar(game_dir, version_id, &chain)?;
+    let client_jar = resolve_client_jar(base_dir, version_id, &chain)?;
     let (library_classpath, native_dir) =
-        classpath_and_extract_natives(game_dir, version_id, &chain)?;
+        classpath_and_extract_natives(base_dir, game_dir, version_id, &chain)?;
     let (library_classpath, jopt_simple_path) =
-        include_jopt_simple_classpath(&game_dir, &chain, &library_classpath)?;
+        include_jopt_simple_classpath(base_dir, game_dir, &chain, &library_classpath)?;
     let mut classpath_parts = Vec::new();
     if !library_classpath.is_empty() {
         classpath_parts.push(library_classpath);
@@ -3000,7 +3090,7 @@ fn launch_game(
     classpath_parts.push(client_jar.to_string_lossy().into_owned());
     let classpath = classpath_parts.join(if cfg!(windows) { ";" } else { ":" });
 
-    let assets_root = game_dir.join("assets").to_string_lossy().into_owned();
+    let assets_root = base_dir.join("assets").to_string_lossy().into_owned();
     let asset_index = first_field(&chain, "assetIndex")
         .and_then(|index| index.get("id"))
         .and_then(Value::as_str)
@@ -3118,7 +3208,7 @@ fn launch_game(
             "--gameDir".to_string(),
             game_dir.to_string_lossy().into_owned(),
             "--assetsDir".to_string(),
-            game_dir.join("assets").to_string_lossy().into_owned(),
+            base_dir.join("assets").to_string_lossy().into_owned(),
             "--assetIndex".to_string(),
             first_field(&chain, "assetIndex")
                 .and_then(|index| index.get("id"))
@@ -3133,6 +3223,7 @@ fn launch_game(
             "legacy".to_string(),
         ];
     }
+    set_profile_game_directories(&mut game_args, game_dir, base_dir);
     set_game_option(&mut game_args, "--width", launch_settings.width.to_string());
     set_game_option(
         &mut game_args,
@@ -3199,7 +3290,15 @@ fn launch_version(
     username: String,
 ) -> Result<LaunchResult, String> {
     let (game_dir, version_id) = modpack::resolve_profile(&app, &profile_key)?;
-    launch_game(&app, &game_dir, &version_id, &profile_key, &username)
+    let base_dir = modpack::resolve_profile_base(&app, &profile_key)?;
+    launch_game(
+        &app,
+        &game_dir,
+        &base_dir,
+        &version_id,
+        &profile_key,
+        &username,
+    )
 }
 
 #[tauri::command]
@@ -4703,7 +4802,7 @@ mod tests {
         assert!(game.iter().any(|arg| arg == "${game_directory}"));
 
         let (classpath, native_dir) =
-            classpath_and_extract_natives(&game_dir, fabric_id, &chain).unwrap();
+            classpath_and_extract_natives(&game_dir, &game_dir, fabric_id, &chain).unwrap();
         assert_eq!(native_dir, profile_dir.join("natives"));
         assert!(classpath.contains("fabric-loader-0.19.5.jar"));
         assert!(classpath.contains("net/sf/jopt-simple/jopt-simple/5.0.4/jopt-simple-5.0.4.jar"));
@@ -4726,8 +4825,8 @@ mod tests {
         let missing_path = safe_join(&game_dir, &missing_spec.relative_path).unwrap();
         fs::remove_file(&missing_path).unwrap();
         let missing_error =
-            classpath_and_extract_natives(&game_dir, fabric_id, &chain).unwrap_err();
-        assert!(missing_error.contains("required Minecraft library is missing"));
+            classpath_and_extract_natives(&game_dir, &game_dir, fabric_id, &chain).unwrap_err();
+        assert!(missing_error.contains("is missing"), "{missing_error}");
         assert!(game_dir.join("mods/example-mod.jar").is_file());
 
         let versions = installed_versions(&game_dir);
@@ -4824,13 +4923,167 @@ mod tests {
         jar.finish().unwrap();
 
         let (classpath, resolved_path) =
-            include_jopt_simple_classpath(&game_dir, &chain, "").unwrap();
+            include_jopt_simple_classpath(&game_dir, &game_dir, &chain, "").unwrap();
         assert_eq!(resolved_path.as_deref(), Some(jar_path.as_path()));
         assert!(classpath.contains(&jar_path.to_string_lossy().to_string()));
-        let (unchanged, _) = include_jopt_simple_classpath(&game_dir, &chain, &classpath).unwrap();
+        let (unchanged, _) =
+            include_jopt_simple_classpath(&game_dir, &game_dir, &chain, &classpath).unwrap();
         assert_eq!(
             unchanged, classpath,
             "do not add duplicate classpath entries"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_profiles_share_verified_base_assets_but_keep_mutable_game_dirs_separate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bee-direct-base-launch-test-{unique}"));
+        let base = root.join("selected-minecraft");
+        let first = root.join("instances/first");
+        let second = root.join("instances/second");
+        let asset_index = b"offline asset index";
+        let asset_object = b"offline asset object";
+        let version_jar = b"offline client jar";
+        let library = b"offline game library";
+        for relative in [
+            "assets/indexes",
+            "assets/objects",
+            "versions/Fabric 26.3",
+            "libraries/test",
+        ] {
+            fs::create_dir_all(base.join(relative)).unwrap();
+        }
+        for profile in [&first, &second] {
+            for folder in [
+                "mods",
+                "config",
+                "saves/world",
+                "resourcepacks",
+                "shaderpacks",
+            ] {
+                fs::create_dir_all(profile.join(folder)).unwrap();
+            }
+        }
+
+        let asset_hash = sha1_bytes(asset_object);
+        let asset_path = base.join(format!(
+            "assets/objects/{}/{}",
+            &asset_hash[..2],
+            asset_hash
+        ));
+        fs::create_dir_all(asset_path.parent().unwrap()).unwrap();
+        fs::write(base.join("assets/indexes/34.json"), asset_index).unwrap();
+        fs::write(&asset_path, asset_object).unwrap();
+        let version_path = base.join("versions/Fabric 26.3/Fabric 26.3.jar");
+        let library_path = base.join("libraries/test/library.jar");
+        fs::write(&version_path, version_jar).unwrap();
+        fs::write(&library_path, library).unwrap();
+
+        let asset_spec = ArtifactSpec {
+            relative_path: format!("assets/objects/{}/{}", &asset_hash[..2], asset_hash),
+            url: String::new(),
+            fallback_urls: Vec::new(),
+            sha1: Some(asset_hash),
+            size: Some(asset_object.len() as u64),
+        };
+        let client_spec = ArtifactSpec {
+            relative_path: "versions/Fabric 26.3/Fabric 26.3.jar".to_string(),
+            url: String::new(),
+            fallback_urls: Vec::new(),
+            sha1: Some(sha1_bytes(version_jar)),
+            size: Some(version_jar.len() as u64),
+        };
+        for profile in [&first, &second] {
+            assert_eq!(
+                local_runtime_artifact(&base, profile, &asset_spec, "asset object").unwrap(),
+                asset_path
+            );
+            assert_eq!(
+                local_runtime_artifact(&base, profile, &client_spec, "client JAR").unwrap(),
+                version_path
+            );
+        }
+        let library_spec = ArtifactSpec {
+            relative_path: "libraries/test/library.jar".to_string(),
+            url: String::new(),
+            fallback_urls: Vec::new(),
+            sha1: Some(sha1_bytes(library)),
+            size: Some(library.len() as u64),
+        };
+        assert_eq!(
+            local_runtime_artifact(&base, &first, &library_spec, "game library").unwrap(),
+            library_path
+        );
+
+        fs::write(first.join("mods/pack.jar"), b"first mod").unwrap();
+        fs::write(second.join("mods/pack.jar"), b"second mod").unwrap();
+        fs::write(first.join("options.txt"), b"first options").unwrap();
+        fs::write(second.join("options.txt"), b"second options").unwrap();
+        fs::write(first.join("saves/world/level.dat"), b"first world").unwrap();
+        fs::write(second.join("saves/world/level.dat"), b"second world").unwrap();
+        fs::write(first.join("resourcepacks/pack.zip"), b"first resource pack").unwrap();
+        fs::write(
+            second.join("resourcepacks/pack.zip"),
+            b"second resource pack",
+        )
+        .unwrap();
+        fs::write(first.join("shaderpacks/pack.zip"), b"first shader").unwrap();
+        fs::write(second.join("shaderpacks/pack.zip"), b"second shader").unwrap();
+
+        let mut first_args = vec![
+            "--gameDir".to_string(),
+            "stale-game-dir".to_string(),
+            "--assetsDir=stale-assets-dir".to_string(),
+        ];
+        let mut second_args = Vec::new();
+        set_profile_game_directories(&mut first_args, &first, &base);
+        set_profile_game_directories(&mut second_args, &second, &base);
+        let option_value = |args: &[String], option: &str| {
+            args.windows(2)
+                .find(|pair| pair[0] == option)
+                .map(|pair| pair[1].clone())
+                .unwrap()
+        };
+        assert_eq!(
+            option_value(&first_args, "--gameDir"),
+            first.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            option_value(&second_args, "--gameDir"),
+            second.to_string_lossy().into_owned()
+        );
+        let expected_assets_dir = base.join("assets").to_string_lossy().into_owned();
+        assert_eq!(
+            option_value(&first_args, "--assetsDir"),
+            expected_assets_dir
+        );
+        assert_eq!(
+            option_value(&second_args, "--assetsDir"),
+            expected_assets_dir
+        );
+        for profile in [&first, &second] {
+            for immutable in ["assets", "libraries", "versions"] {
+                assert!(!profile.join(immutable).exists());
+            }
+        }
+        assert_eq!(fs::read(&asset_path).unwrap(), asset_object);
+        assert_eq!(fs::read(&version_path).unwrap(), version_jar);
+        assert_eq!(fs::read(&library_path).unwrap(), library);
+        assert_eq!(
+            fs::read(base.join("assets/indexes/34.json")).unwrap(),
+            asset_index
+        );
+        assert_ne!(
+            fs::read(first.join("mods/pack.jar")).unwrap(),
+            fs::read(second.join("mods/pack.jar")).unwrap()
+        );
+        assert_ne!(
+            fs::read(first.join("options.txt")).unwrap(),
+            fs::read(second.join("options.txt")).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }

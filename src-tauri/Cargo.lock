@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "blockline-launcher"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "base64 0.22.1",
  "md5",

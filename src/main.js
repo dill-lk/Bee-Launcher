@@ -55,6 +55,14 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.39', date: '2026-11-13', title: 'Use the selected Minecraft folder directly',
+    changes: [
+      'Modpacks use the selected .minecraft assets, client JARs, versions, and libraries directly without copying or downloading Minecraft base files.',
+      'Each Bee profile keeps its own mods, configs, saves, options, resource packs, shaders, and extracted natives; every referenced asset object is still checked by size and SHA-1.',
+      'The matching Minecraft and loader profile must already be installed in the selected folder; missing local files are reported instead of fetched.',
+    ],
+  },
+  {
     version: '0.1.38', date: '2026-11-13', title: 'Reuse working Minecraft assets offline',
     changes: [
       'Uses a valid local asset index even when its bytes differ from Mojang metadata, while verifying every referenced object by size and SHA-1.',
