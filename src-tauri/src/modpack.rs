@@ -1645,9 +1645,21 @@ fn copy_local_file(
             destination.display()
         ));
     }
+    if !source.exists() {
+        return Err(format!(
+            "The installed {label} is missing at {}; it cannot be reused offline.",
+            source.display()
+        ));
+    }
+    if !source.is_file() {
+        return Err(format!(
+            "The installed {label} exists at {} but is not a regular file; it was left unchanged.",
+            source.display()
+        ));
+    }
     if !artifact_matches(source, expected_size, expected_sha1) {
         return Err(format!(
-            "Could not reuse the installed {label} from {}. Open that Minecraft profile once so its files are installed, then retry the ZIP import.",
+            "The installed {label} exists at {} but its size or SHA-1 does not match the expected content; it was left unchanged.",
             source.display()
         ));
     }
@@ -1782,6 +1794,84 @@ fn copy_local_artifact(
     )
 }
 
+fn read_asset_index(path: &Path) -> Result<(Value, Vec<u8>), String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "Could not inspect Minecraft asset index at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Minecraft asset index at {} is not a regular file.",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_ASSET_INDEX_BYTES {
+        return Err(format!(
+            "Minecraft asset index at {} is unexpectedly large.",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "Could not read Minecraft asset index at {}: {error}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Minecraft asset index at {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    Ok((value, bytes))
+}
+
+fn asset_object_specs(index_value: &Value) -> Result<Vec<(ArtifactSpec, String)>, String> {
+    let objects = index_value
+        .get("objects")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Minecraft asset index has no asset objects.".to_string())?;
+    let mut hashes_seen = HashMap::<String, u64>::new();
+    let mut specs = Vec::with_capacity(objects.len());
+    for (name, object) in objects {
+        let hash = object
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Minecraft asset {name} has no checksum."))?;
+        if !valid_sha1(hash) {
+            return Err(format!("Minecraft asset {name} has an invalid checksum."));
+        }
+        let size = object
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("Minecraft asset {name} has no size."))?;
+        let normalized_hash = hash.to_ascii_lowercase();
+        if let Some(previous_size) = hashes_seen.get(&normalized_hash) {
+            if *previous_size != size {
+                return Err(format!(
+                    "Minecraft asset index assigns conflicting sizes to checksum {hash}."
+                ));
+            }
+            continue;
+        }
+        hashes_seen.insert(normalized_hash, size);
+        let prefix = &hash[..2];
+        specs.push((
+            ArtifactSpec {
+                relative_path: format!("assets/objects/{prefix}/{hash}"),
+                url: format!("https://resources.download.minecraft.net/{prefix}/{hash}"),
+                fallback_urls: Vec::new(),
+                sha1: Some(hash.to_string()),
+                size: Some(size),
+            },
+            name.clone(),
+        ));
+    }
+    Ok(specs)
+}
+
 fn copy_installed_assets(
     app: Option<&AppHandle>,
     client: &Client,
@@ -1813,11 +1903,29 @@ fn copy_installed_assets(
     })?;
     let index_path = safe_join(profile_game_dir, &spec.relative_path)?;
     let source_index_path = safe_join(source_game_dir, &spec.relative_path)?;
-    if !artifact_matches(&index_path, spec.size, spec.sha1.as_deref())
-        && !artifact_matches(&source_index_path, spec.size, spec.sha1.as_deref())
-    {
-        let shared_index_path = safe_join(destination_game_dir, &spec.relative_path)?;
-        if artifact_matches(&shared_index_path, spec.size, spec.sha1.as_deref()) {
+    let shared_index_path = safe_join(destination_game_dir, &spec.relative_path)?;
+    if !artifact_matches(&index_path, spec.size, spec.sha1.as_deref()) {
+        if index_path.exists() {
+            let (profile_index, _) = read_asset_index(&index_path).map_err(|error| {
+                format!(
+                    "The existing profile-local Minecraft asset index at {} was left unchanged because it cannot be used: {error}",
+                    index_path.display()
+                )
+            })?;
+            asset_object_specs(&profile_index).map_err(|error| {
+                format!(
+                    "The existing profile-local Minecraft asset index at {} was left unchanged because it cannot be used: {error}",
+                    index_path.display()
+                )
+            })?;
+        } else if artifact_matches(&source_index_path, spec.size, spec.sha1.as_deref()) {
+            copy_local_artifact(
+                source_game_dir,
+                profile_game_dir,
+                &spec,
+                "Minecraft asset index",
+            )?;
+        } else if artifact_matches(&shared_index_path, spec.size, spec.sha1.as_deref()) {
             copy_local_file(
                 &shared_index_path,
                 &index_path,
@@ -1825,64 +1933,60 @@ fn copy_installed_assets(
                 spec.sha1.as_deref(),
                 "Minecraft asset index",
             )?;
-        } else if let Some(app) = app {
-            // Asset-index IDs such as "34" can collide across Minecraft profiles.
-            // If both local copies are stale, download the metadata-pinned index;
-            // install_assets still reuses only checksum-verified shared objects.
-            install_assets(app, client, profile_game_dir, destination_game_dir, chain)?;
-            return Ok(());
+        } else if source_index_path.exists() {
+            // A working offline Minecraft installation can have a local index
+            // whose bytes differ from the index server's metadata. Accept only
+            // a bounded, valid index; every referenced object is still checked
+            // against its own SHA-1 and size before sharing.
+            let local_index = read_asset_index(&source_index_path).and_then(|(value, bytes)| {
+                asset_object_specs(&value)?;
+                Ok(bytes)
+            });
+            match local_index {
+                Ok(bytes) => {
+                    let local_sha1 = sha1_bytes(&bytes);
+                    copy_local_file(
+                        &source_index_path,
+                        &index_path,
+                        Some(bytes.len() as u64),
+                        Some(&local_sha1),
+                        "offline Minecraft asset index",
+                    )?;
+                }
+                Err(local_error) => {
+                    let reason = format!(
+                        "A local Minecraft asset index exists at {} but is not usable offline: {local_error}",
+                        source_index_path.display()
+                    );
+                    if let Some(app) = app {
+                        install_assets(app, client, profile_game_dir, destination_game_dir, chain)
+                            .map_err(|download_error| {
+                                format!("{reason} The metadata-pinned Mojang fallback also failed: {download_error}")
+                            })?;
+                        return Ok(());
+                    }
+                    return Err(reason);
+                }
+            }
+        } else {
+            let reason = format!(
+                "The local Minecraft asset index is missing at {}; no metadata-matching shared index is available for offline reuse.",
+                source_index_path.display()
+            );
+            if let Some(app) = app {
+                install_assets(app, client, profile_game_dir, destination_game_dir, chain)
+                    .map_err(|download_error| {
+                        format!(
+                            "{reason} The metadata-pinned Mojang download failed: {download_error}"
+                        )
+                    })?;
+                return Ok(());
+            }
+            return Err(reason);
         }
     }
-    copy_local_artifact(
-        source_game_dir,
-        profile_game_dir,
-        &spec,
-        "Minecraft asset index",
-    )?;
-    let index_size = fs::metadata(&index_path)
-        .map_err(|error| format!("Could not read Minecraft asset-index details: {error}"))?
-        .len();
-    if index_size > MAX_ASSET_INDEX_BYTES {
-        return Err("The Minecraft asset index is unexpectedly large.".to_string());
-    }
-    let index_value: Value = serde_json::from_slice(
-        &fs::read(&index_path)
-            .map_err(|error| format!("Could not read Minecraft asset index: {error}"))?,
-    )
-    .map_err(|error| format!("Minecraft asset index is invalid: {error}"))?;
-    let objects = index_value
-        .get("objects")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Minecraft asset index has no asset objects.".to_string())?;
-    let mut hashes_seen = HashSet::new();
-    let mut specs = Vec::with_capacity(objects.len());
-    for (name, object) in objects {
-        let hash = object
-            .get("hash")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("Minecraft asset {name} has no checksum."))?;
-        if !valid_sha1(hash) {
-            return Err(format!("Minecraft asset {name} has an invalid checksum."));
-        }
-        if !hashes_seen.insert(hash.to_ascii_lowercase()) {
-            continue;
-        }
-        let size = object
-            .get("size")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("Minecraft asset {name} has no size."))?;
-        let prefix = &hash[..2];
-        specs.push((
-            ArtifactSpec {
-                relative_path: format!("assets/objects/{prefix}/{hash}"),
-                url: format!("https://resources.download.minecraft.net/{prefix}/{hash}"),
-                fallback_urls: Vec::new(),
-                sha1: Some(hash.to_string()),
-                size: Some(size),
-            },
-            name.clone(),
-        ));
-    }
+    let (index_value, _) = read_asset_index(&index_path)?;
+    let specs = asset_object_specs(&index_value)?;
     let total = specs.len();
     if let Some(app) = app {
         report_progress(
@@ -4191,6 +4295,216 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).expect("isolated test fixture should be removed");
+    }
+
+    #[test]
+    fn offline_local_asset_index_mismatch_reuses_verified_local_objects() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-offline-local-assets-{unique}"));
+        let source = root.join("selected-minecraft");
+        let common = root.join("minecraft-common");
+        let profile = root.join("instances/offline-pack");
+        let local_asset = b"verified offline Minecraft object";
+        let local_hash = sha1_bytes(local_asset);
+        let local_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "music/menu": {
+                    "hash": local_hash.clone(),
+                    "size": local_asset.len()
+                }
+            }
+        }))
+        .expect("local asset index should encode");
+        let metadata_asset = b"metadata-pinned object not in local index";
+        let metadata_hash = sha1_bytes(metadata_asset);
+        let metadata_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "music/metadata-only": {
+                    "hash": metadata_hash,
+                    "size": metadata_asset.len()
+                }
+            }
+        }))
+        .expect("metadata-pinned index fixture should encode");
+        let source_index = source.join("assets/indexes/34.json");
+        let shared_index = common.join("assets/indexes/34.json");
+        let source_object = source.join(format!(
+            "assets/objects/{}/{}",
+            &local_hash[..2],
+            local_hash
+        ));
+        let shared_object = common.join(format!(
+            "assets/objects/{}/{}",
+            &local_hash[..2],
+            local_hash
+        ));
+        let other_pack_index = b"another pack's index with the same short ID";
+        fs::create_dir_all(source_index.parent().unwrap())
+            .expect("local asset-index folder should be created");
+        fs::create_dir_all(source_object.parent().unwrap())
+            .expect("local asset-object folder should be created");
+        fs::create_dir_all(shared_index.parent().unwrap())
+            .expect("shared index folder should be created");
+        fs::write(&source_index, &local_index).expect("local asset index should be written");
+        fs::write(&source_object, local_asset).expect("local asset object should be written");
+        fs::write(&shared_index, other_pack_index).expect("other pack's index should be written");
+
+        let chain = vec![(
+            "26.3".to_string(),
+            serde_json::json!({
+                "assetIndex": {
+                    "id": "34",
+                    "url": "https://example.invalid/34.json",
+                    "sha1": sha1_bytes(&metadata_index),
+                    "size": metadata_index.len()
+                }
+            }),
+        )];
+        assert!(!artifact_matches(
+            &source_index,
+            Some(metadata_index.len() as u64),
+            Some(&sha1_bytes(&metadata_index))
+        ));
+
+        copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
+            .expect("a complete local index and verified objects should work offline");
+        ensure_profile_shared_game_files(&profile, &common)
+            .expect("the profile should keep its index private and share verified objects");
+
+        assert_eq!(fs::read(&source_index).unwrap(), local_index);
+        assert_eq!(
+            fs::read(profile.join("assets/indexes/34.json")).unwrap(),
+            local_index
+        );
+        assert_eq!(fs::read(&shared_index).unwrap(), other_pack_index);
+        assert_eq!(fs::read(&source_object).unwrap(), local_asset);
+        assert_eq!(fs::read(&shared_object).unwrap(), local_asset);
+        assert!(!is_linked_to(
+            &profile.join("assets/indexes"),
+            &common.join("assets/indexes")
+        ));
+        assert!(is_linked_to(
+            &profile.join("assets/objects"),
+            &common.join("assets/objects")
+        ));
+        fs::remove_dir_all(root).expect("offline fixture tree should be removed");
+    }
+
+    #[test]
+    fn offline_asset_index_reports_a_truly_missing_local_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-missing-local-index-{unique}"));
+        let source = root.join("selected-minecraft");
+        let common = root.join("minecraft-common");
+        let profile = root.join("instances/missing-index-pack");
+        let source_index = source.join("assets/indexes/34.json");
+        let shared_index = common.join("assets/indexes/34.json");
+        let other_pack_index = b"another pack's index with the same short ID";
+        fs::create_dir_all(source_index.parent().unwrap())
+            .expect("local index directory should exist even though its file is absent");
+        fs::create_dir_all(shared_index.parent().unwrap())
+            .expect("shared index directory should be created");
+        fs::write(&shared_index, other_pack_index).expect("other pack's index should be written");
+        let metadata_index = br#"{"objects":{}}"#;
+        let chain = vec![(
+            "26.3".to_string(),
+            serde_json::json!({
+                "assetIndex": {
+                    "id": "34",
+                    "url": "https://example.invalid/34.json",
+                    "sha1": sha1_bytes(metadata_index),
+                    "size": metadata_index.len()
+                }
+            }),
+        )];
+
+        let error = copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
+            .expect_err(
+                "offline import must not claim a missing index is just a checksum mismatch",
+            );
+        assert!(error.contains("asset index is missing at"), "{error}");
+        assert!(
+            error.contains(&source_index.display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains("exists at"), "{error}");
+        assert_eq!(fs::read(&shared_index).unwrap(), other_pack_index);
+        assert!(!profile.join("assets/indexes/34.json").exists());
+        fs::remove_dir_all(root).expect("missing-index fixture tree should be removed");
+    }
+
+    #[test]
+    fn offline_metadata_mismatched_index_does_not_bypass_asset_object_hash_checks() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-offline-corrupt-object-{unique}"));
+        let source = root.join("selected-minecraft");
+        let common = root.join("minecraft-common");
+        let profile = root.join("instances/corrupt-object-pack");
+        let expected_asset = b"expected valid asset object";
+        let corrupt_asset = b"corrupt object bytes";
+        let expected_hash = sha1_bytes(expected_asset);
+        let local_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "music/menu": {
+                    "hash": expected_hash.clone(),
+                    "size": expected_asset.len()
+                }
+            }
+        }))
+        .expect("local asset index should encode");
+        let metadata_index = br#"{"objects":{"other":{"hash":"1111111111111111111111111111111111111111","size":1}}}"#;
+        let source_index = source.join("assets/indexes/34.json");
+        let shared_index = common.join("assets/indexes/34.json");
+        let source_object = source.join(format!(
+            "assets/objects/{}/{}",
+            &expected_hash[..2],
+            expected_hash
+        ));
+        let shared_object = common.join(format!(
+            "assets/objects/{}/{}",
+            &expected_hash[..2],
+            expected_hash
+        ));
+        let other_pack_index = b"another pack's index with the same short ID";
+        fs::create_dir_all(source_index.parent().unwrap())
+            .expect("local asset-index folder should be created");
+        fs::create_dir_all(source_object.parent().unwrap())
+            .expect("local object folder should be created");
+        fs::create_dir_all(shared_index.parent().unwrap())
+            .expect("shared index folder should be created");
+        fs::write(&source_index, &local_index).expect("local index should be written");
+        fs::write(&source_object, corrupt_asset).expect("corrupt object fixture should be written");
+        fs::write(&shared_index, other_pack_index).expect("other pack's index should be written");
+        let chain = vec![(
+            "26.3".to_string(),
+            serde_json::json!({
+                "assetIndex": {
+                    "id": "34",
+                    "url": "https://example.invalid/34.json",
+                    "sha1": sha1_bytes(metadata_index),
+                    "size": metadata_index.len()
+                }
+            }),
+        )];
+
+        let error = copy_installed_assets(None, &Client::new(), &source, &common, &profile, &chain)
+            .expect_err("offline reuse must reject an object that fails its declared hash/size");
+        assert!(error.contains("exists at"), "{error}");
+        assert!(error.contains("size or SHA-1"), "{error}");
+        assert_eq!(fs::read(&source_index).unwrap(), local_index);
+        assert_eq!(fs::read(&source_object).unwrap(), corrupt_asset);
+        assert_eq!(fs::read(&shared_index).unwrap(), other_pack_index);
+        assert!(!shared_object.exists());
+        fs::remove_dir_all(root).expect("corrupt-object fixture tree should be removed");
     }
 
     #[test]

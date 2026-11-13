@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.38', date: '2026-11-13', title: 'Reuse working Minecraft assets offline',
+    changes: [
+      'Uses a valid local asset index even when its bytes differ from Mojang metadata, while verifying every referenced object by size and SHA-1.',
+      'Distinguishes a missing local index from a metadata mismatch and leaves the selected .minecraft folder and other pack indexes untouched.',
+    ],
+  },
+  {
     version: '0.1.37', date: '2026-11-13', title: 'Restore Windows shortcut behavior',
     changes: [
       'The NSIS installer creates both the Bee Launcher Start Menu and Desktop shortcuts, and the uninstaller cleans up legacy Blockline Launcher shortcuts.',
