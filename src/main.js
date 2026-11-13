@@ -55,11 +55,18 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.34', date: '2026-11-13', title: 'Safer modpack imports and a custom Bee setup',
+    changes: [
+      'Keeps each pack’s checksum-verified Minecraft asset index inside its own profile while sharing only hash-addressed asset objects. Packs that reuse an asset-index ID with different contents no longer block imports or replace another profile’s index.',
+      'Leaves existing shared indexes and the selected .minecraft source untouched, and adds isolated repeat-import regression tests for colliding index IDs.',
+      'Replaces the Windows NSIS/MSI installer path with a Bee Launcher-styled standalone setup and uninstaller. Uninstall removes Bee app files and shortcuts while keeping profiles, OUTBREAK, Smallhold, worlds, saves, backups, and Minecraft folders.',
+    ],
+  },
+  {
     version: '0.1.33', date: '2026-11-13', title: 'Copy local Minecraft base on first import',
     changes: [
       'On the first modpack import from a selected .minecraft folder, physically copies its assets, libraries, and version metadata/JARs into Bee’s shared store; later profiles reuse that Bee-owned copy.',
       'Copies only immutable game-file folders. The selected source, mods, configs, saves, and other profile data stay untouched and isolated; conflicting shared files are preserved rather than overwritten.',
-      'The Windows installer and uninstaller now use Bee-themed artwork, matching icons, and a friendly farewell header.',
     ],
   },
   {
@@ -686,11 +693,11 @@ function openPanel(name, title = '') {
   } else if (name === 'mods') {
     sheet.innerHTML = `${panelHeader('Import a modpack', 'Modrinth .mrpack or CurseForge ZIP')}
       <div class="panel-scroll">
-      <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>Each profile keeps its own mods, configs, resource packs, shaders, saves, and options. Common Minecraft assets, libraries, and version files are shared to save disk space. Your selected .minecraft folder stays untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose modpack file</button>
+      <div class="pack-import-card"><div class="pack-import-copy"><b>Install as a separate profile</b><small>Each profile keeps its own mods, configs, asset index, resource packs, shaders, saves, and options. Hash-addressed Minecraft asset objects, libraries, and version files are shared to save disk space. Your selected .minecraft folder stays untouched.</small></div><button class="btn pri" id="import-modpack-button">Choose modpack file</button>
         <div class="import-progress" id="modpack-progress" hidden><div class="import-progress-copy"><b id="modpack-progress-title">Getting ready…</b><small id="modpack-progress-message">Modrinth and CurseForge imports may download game files and loader components; Bee ZIPs reuse a matching local profile.</small></div><progress id="modpack-progress-bar" max="100" value="0"></progress><small id="modpack-progress-detail">0%</small></div>
       </div>
       <div class="section-intro modpack-list-heading"><h3>Imported profiles</h3><p>Select one here or choose it from the Play profile menu.</p></div><div class="profile-list" id="modpack-list"></div>
-      <div class="local-note"><span class="note-mark">i</span><span>Modrinth format-v1 and CurseForge Minecraft modpack ZIPs support vanilla, Fabric, Quilt, Forge, or NeoForge with one loader per pack. CurseForge imports fetch exact pinned files over HTTPS; Bee ZIP bundles remain offline and need a matching profile plus every listed client file inside the ZIP. Mods, configs, resource packs, shaders, saves, and options stay profile-local; common game files are reused from Bee's shared store. Modrinth downloads are checked against manifest hashes; CurseForge downloads are checked against the pinned file IDs and file sizes.</span></div>
+      <div class="local-note"><span class="note-mark">i</span><span>Modrinth format-v1 and CurseForge Minecraft modpack ZIPs support vanilla, Fabric, Quilt, Forge, or NeoForge with one loader per pack. CurseForge imports fetch exact pinned files over HTTPS; Bee ZIP bundles remain offline and need a matching profile plus every listed client file inside the ZIP. Mods, configs, asset indexes, resource packs, shaders, saves, and options stay profile-local; hash-addressed asset objects and other immutable game files are reused from Bee's shared store. Modrinth downloads are checked against manifest hashes; CurseForge downloads are checked against the pinned file IDs and file sizes.</span></div>
       <section class="world-backup-card"><div class="section-intro"><h3>World backups</h3><p>Create a local safety copy, or review a backup before restoring it. Imported packs keep separate saves.</p></div><div class="world-backup-controls"><label for="world-backup-profile">Saves folder</label><select class="fld" id="world-backup-profile"><option value="">Default Minecraft folder</option></select><button class="btn pri" id="create-world-backup">Back up worlds</button></div><div class="world-backup-status" id="world-backup-status" role="status"></div><div class="world-backup-list" id="world-backup-list"></div><div class="world-restore-review" id="world-restore-review" hidden></div></section>
       </div>`;
     $('#import-modpack-button').addEventListener('click', pickModpack);

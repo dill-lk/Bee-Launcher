@@ -624,10 +624,160 @@ fn is_linked_to(path: &Path, target: &Path) -> bool {
             .is_some_and(|(actual, expected)| actual == expected)
 }
 
+fn ensure_profile_shared_assets(profile_dir: &Path, common_dir: &Path) -> Result<(), String> {
+    let shared_assets = common_dir.join("assets");
+    match fs::symlink_metadata(&shared_assets) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to use a linked or non-directory shared assets folder: {}",
+                shared_assets.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&shared_assets)
+                .map_err(|error| format!("Could not prepare shared Minecraft assets: {error}"))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect shared Minecraft assets {}: {error}",
+                shared_assets.display()
+            ));
+        }
+    }
+
+    let profile_assets = profile_dir.join("assets");
+    if is_linked_to(&profile_assets, &shared_assets) {
+        // Older profiles used a whole-directory junction. Leave it intact: new
+        // imports no longer rewrite shared indexes, so these profiles stay safe.
+        return Ok(());
+    }
+    match fs::symlink_metadata(&profile_assets) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to replace a linked or non-directory profile assets path: {}",
+                profile_assets.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&profile_assets).map_err(|error| {
+                format!("Could not create the profile's local assets folder: {error}")
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect profile assets {}: {error}",
+                profile_assets.display()
+            ));
+        }
+    }
+
+    let local_indexes = profile_assets.join("indexes");
+    match fs::symlink_metadata(&local_indexes) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to use a linked or non-directory profile asset-index folder: {}",
+                local_indexes.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&local_indexes).map_err(|error| {
+                format!("Could not create the profile's local asset-index folder: {error}")
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect profile asset indexes {}: {error}",
+                local_indexes.display()
+            ));
+        }
+    }
+
+    let shared_objects = shared_assets.join("objects");
+    match fs::symlink_metadata(&shared_objects) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to use a linked or non-directory shared asset-object folder: {}",
+                shared_objects.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&shared_objects).map_err(|error| {
+                format!("Could not prepare shared Minecraft asset objects: {error}")
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect shared asset objects {}: {error}",
+                shared_objects.display()
+            ));
+        }
+    }
+
+    let profile_objects = profile_assets.join("objects");
+    if is_linked_to(&profile_objects, &shared_objects) {
+        return Ok(());
+    }
+    match fs::symlink_metadata(&profile_objects) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!(
+                "Refusing to replace a linked or non-directory profile asset-object path: {}",
+                profile_objects.display()
+            ));
+        }
+        Ok(_) => merge_shared_tree(&profile_objects, &shared_objects)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect profile asset objects {}: {error}",
+                profile_objects.display()
+            ));
+        }
+    }
+
+    let backup = profile_assets.join(".objects.bee-local-backup");
+    if backup.exists() {
+        return Err(format!(
+            "A previous safe asset-object migration copy already exists at {}; it was left untouched.",
+            backup.display()
+        ));
+    }
+    let had_local_dir = profile_objects.exists();
+    if had_local_dir {
+        fs::rename(&profile_objects, &backup).map_err(|error| {
+            format!(
+                "Could not stage {} for a safe shared asset-object switch: {error}",
+                profile_objects.display()
+            )
+        })?;
+    }
+    if let Err(error) = create_directory_link(&shared_objects, &profile_objects) {
+        if had_local_dir {
+            let _ = fs::rename(&backup, &profile_objects);
+        }
+        return Err(format!(
+            "Could not link this profile to shared asset objects: {error}"
+        ));
+    }
+    if had_local_dir {
+        if let Err(error) = fs::remove_dir_all(&backup) {
+            return Err(format!(
+                "The profile now uses shared asset objects, but its unchanged migration copy remains at {} because cleanup failed: {error}",
+                backup.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_profile_shared_game_files(profile_dir: &Path, common_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(profile_dir)
         .map_err(|error| format!("Could not prepare the modpack profile folder: {error}"))?;
-    for folder in ["assets", "libraries", "versions"] {
+    ensure_profile_shared_assets(profile_dir, common_dir)?;
+    for folder in ["libraries", "versions"] {
         let shared_path = common_dir.join(folder);
         fs::create_dir_all(&shared_path)
             .map_err(|error| format!("Could not prepare shared {folder}: {error}"))?;
@@ -1636,6 +1786,7 @@ fn copy_installed_assets(
     app: Option<&AppHandle>,
     source_game_dir: &Path,
     destination_game_dir: &Path,
+    profile_game_dir: &Path,
     chain: &[(String, Value)],
 ) -> Result<(), String> {
     let asset_index = chain
@@ -1659,10 +1810,10 @@ fn copy_installed_assets(
     let spec = artifact_spec(asset_index, Some(relative), None).ok_or_else(|| {
         "The installed Minecraft profile has incomplete asset-index metadata.".to_string()
     })?;
-    let index_path = safe_join(destination_game_dir, &spec.relative_path)?;
+    let index_path = safe_join(profile_game_dir, &spec.relative_path)?;
     copy_local_artifact(
         source_game_dir,
-        destination_game_dir,
+        profile_game_dir,
         &spec,
         "Minecraft asset index",
     )?;
@@ -2198,6 +2349,7 @@ fn reuse_installed_minecraft_base(
     app: Option<&AppHandle>,
     source_game_dir: &Path,
     destination_game_dir: &Path,
+    profile_game_dir: &Path,
     minecraft: &str,
 ) -> Result<Option<Value>, String> {
     let Some(metadata) = super::metadata_at(source_game_dir, minecraft) else {
@@ -2226,7 +2378,13 @@ fn reuse_installed_minecraft_base(
     }
     copy_installed_profile(source_game_dir, destination_game_dir, &chain)?;
     copy_installed_libraries(source_game_dir, destination_game_dir, &chain)?;
-    copy_installed_assets(None, source_game_dir, destination_game_dir, &chain)?;
+    copy_installed_assets(
+        None,
+        source_game_dir,
+        destination_game_dir,
+        profile_game_dir,
+        &chain,
+    )?;
     Ok(Some(metadata))
 }
 
@@ -2237,6 +2395,7 @@ fn install_version_metadata(
     minecraft: &str,
     loader: Option<&LoaderPin>,
     source_game_dir: Option<&Path>,
+    profile_game_dir: &Path,
 ) -> Result<String, String> {
     if let Some(app) = app {
         report_progress(
@@ -2249,7 +2408,7 @@ fn install_version_metadata(
         );
     }
     let local_metadata = if let Some(source_game_dir) = source_game_dir {
-        reuse_installed_minecraft_base(app, source_game_dir, game_dir, minecraft)?
+        reuse_installed_minecraft_base(app, source_game_dir, game_dir, profile_game_dir, minecraft)?
     } else {
         None
     };
@@ -2972,7 +3131,8 @@ fn install_pack_files(
 fn install_assets(
     app: &AppHandle,
     client: &Client,
-    game_dir: &Path,
+    profile_game_dir: &Path,
+    shared_game_dir: &Path,
     chain: &[(String, Value)],
 ) -> Result<(), String> {
     let asset_index = chain
@@ -2994,7 +3154,7 @@ fn install_assets(
     let spec = artifact_spec(asset_index, Some(relative), None)
         .ok_or_else(|| "The Minecraft asset index has no HTTPS download URL.".to_string())?;
     report_progress(app, "assets", "Downloading Minecraft asset index", 0, 1, 52);
-    let index_path = ensure_downloaded(client, game_dir, &spec, "Minecraft asset index")?;
+    let index_path = ensure_downloaded(client, profile_game_dir, &spec, "Minecraft asset index")?;
     let index_size = fs::metadata(&index_path)
         .map_err(|error| format!("Could not read Minecraft asset index details: {error}"))?
         .len();
@@ -3049,7 +3209,7 @@ fn install_assets(
             let queue = &queue;
             let completed = &completed;
             let failure = &failure;
-            let game_dir = game_dir.to_path_buf();
+            let game_dir = shared_game_dir.to_path_buf();
             let app = app.clone();
             scope.spawn(move || loop {
                 let spec = queue.lock().ok().and_then(|mut queue| queue.pop_front());
@@ -3337,7 +3497,13 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
             );
             copy_installed_libraries(source_game_dir, &common_dir, &chain)?;
             let _ = super::install_bundled_authlib(&common_dir, &chain)?;
-            copy_installed_assets(Some(app), source_game_dir, &common_dir, &chain)?;
+            copy_installed_assets(
+                Some(app),
+                source_game_dir,
+                &common_dir,
+                &instance_dir,
+                &chain,
+            )?;
             report_progress(
                 app,
                 "minecraft",
@@ -3365,6 +3531,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 &details.minecraft_version,
                 details.loader.as_ref(),
                 installed_game_dir.as_deref(),
+                &instance_dir,
             )?;
             report_progress(
                 app,
@@ -3386,7 +3553,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 1,
                 48,
             );
-            install_assets(app, &client, &common_dir, &chain)?;
+            install_assets(app, &client, &instance_dir, &common_dir, &chain)?;
             profile_id
         };
         ensure_profile_shared_game_files(&instance_dir, &common_dir)?;
@@ -3691,7 +3858,15 @@ mod tests {
                 .expect("profile save should be written");
             ensure_profile_shared_game_files(profile, &common)
                 .expect("imported profile should use Bee's shared files");
-            for folder in ["assets", "libraries", "versions"] {
+            assert!(is_linked_to(
+                &profile.join("assets/objects"),
+                &common.join("assets/objects")
+            ));
+            assert!(!is_linked_to(
+                &profile.join("assets/indexes"),
+                &common.join("assets/indexes")
+            ));
+            for folder in ["libraries", "versions"] {
                 assert!(is_linked_to(&profile.join(folder), &common.join(folder)));
             }
         }
@@ -3747,7 +3922,15 @@ mod tests {
 
         ensure_profile_shared_game_files(&profile, &common)
             .expect("profile should link to shared files");
-        for folder in ["assets", "libraries", "versions"] {
+        assert!(is_linked_to(
+            &profile.join("assets/objects"),
+            &common.join("assets/objects")
+        ));
+        assert!(!is_linked_to(
+            &profile.join("assets/indexes"),
+            &common.join("assets/indexes")
+        ));
+        for folder in ["libraries", "versions"] {
             assert!(is_linked_to(&profile.join(folder), &common.join(folder)));
         }
         assert_eq!(
@@ -3762,7 +3945,7 @@ mod tests {
             fs::read(profile.join("saves/world/level.dat")).unwrap(),
             b"world"
         );
-        assert!(!profile.join(".assets.bee-local-backup").exists());
+        assert!(!profile.join("assets/.objects.bee-local-backup").exists());
         fs::remove_dir_all(root).expect("fixture tree should be removed");
     }
 
@@ -3794,6 +3977,107 @@ mod tests {
         );
         assert!(profile.join("versions").is_dir());
         fs::remove_dir_all(root).expect("fixture tree should be removed");
+    }
+
+    #[test]
+    fn colliding_asset_index_ids_are_isolated_across_repeated_profile_imports() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-asset-index-collision-{unique}"));
+        let common = root.join("minecraft-common");
+        let shared_index = b"an older pack's valid index with the same short ID";
+        fs::create_dir_all(common.join("assets/indexes"))
+            .expect("shared asset-index directory should be created");
+        fs::write(common.join("assets/indexes/34.json"), shared_index)
+            .expect("pre-existing shared index should be written");
+
+        for (pack, object_name, asset_bytes) in [
+            ("outbreak", "music/menu", b"outbreak asset".as_slice()),
+            ("smallhold", "music/calm", b"smallhold asset".as_slice()),
+        ] {
+            let source = root.join(format!("sources/{pack}"));
+            let profile = root.join(format!("instances/{pack}"));
+            let asset_hash = sha1_bytes(asset_bytes);
+            let index = serde_json::to_vec(&serde_json::json!({
+                "objects": {
+                    object_name: {
+                        "hash": asset_hash,
+                        "size": asset_bytes.len()
+                    }
+                }
+            }))
+            .expect("pack-specific asset index should encode");
+            let source_index = source.join("assets/indexes/34.json");
+            fs::create_dir_all(source_index.parent().unwrap())
+                .expect("source index directory should be created");
+            fs::write(&source_index, &index).expect("source index should be written");
+            let source_object = source.join(format!(
+                "assets/objects/{}/{}",
+                &asset_hash[..2],
+                asset_hash
+            ));
+            fs::create_dir_all(source_object.parent().unwrap())
+                .expect("source object directory should be created");
+            fs::write(&source_object, asset_bytes).expect("source object should be written");
+
+            let chain = vec![(
+                "26.3".to_string(),
+                serde_json::json!({
+                    "assetIndex": {
+                        "id": "34",
+                        "url": "https://example.invalid/34.json",
+                        "sha1": sha1_bytes(&index),
+                        "size": index.len()
+                    }
+                }),
+            )];
+            copy_installed_assets(None, &source, &common, &profile, &chain)
+                .expect("a conflicting common index must not block a verified local index");
+            ensure_profile_shared_game_files(&profile, &common)
+                .expect("profile should share objects while keeping its own index");
+
+            let profile_index = profile.join("assets/indexes/34.json");
+            assert_eq!(fs::read(&profile_index).unwrap(), index);
+            assert_eq!(fs::read(&source_index).unwrap(), index);
+            assert_eq!(
+                fs::read(common.join("assets/indexes/34.json")).unwrap(),
+                shared_index
+            );
+            assert_eq!(
+                fs::read(common.join(format!(
+                    "assets/objects/{}/{}",
+                    &asset_hash[..2],
+                    asset_hash
+                )))
+                .unwrap(),
+                asset_bytes
+            );
+            assert!(!is_linked_to(
+                &profile.join("assets/indexes"),
+                &common.join("assets/indexes")
+            ));
+            assert!(is_linked_to(
+                &profile.join("assets/objects"),
+                &common.join("assets/objects")
+            ));
+
+            // An identical repeat for this instance is idempotent; a second
+            // pack with another index body but the same ID stays independent.
+            copy_installed_assets(None, &source, &common, &profile, &chain)
+                .expect("repeated import should reuse the instance's verified index");
+            ensure_profile_shared_game_files(&profile, &common)
+                .expect("repeated sharing should remain idempotent");
+            assert_eq!(fs::read(&profile_index).unwrap(), index);
+        }
+
+        assert_eq!(
+            fs::read(common.join("assets/indexes/34.json")).unwrap(),
+            shared_index,
+            "neither repeated import may replace the shared index"
+        );
+        fs::remove_dir_all(root).expect("isolated fixture tree should be removed");
     }
 
     #[test]
@@ -4180,7 +4464,7 @@ mod tests {
             .expect("copied profile chain should be valid");
         copy_installed_libraries(&source, &destination, &chain)
             .expect("installed libraries should be reused");
-        copy_installed_assets(None, &source, &destination, &chain)
+        copy_installed_assets(None, &source, &destination, &destination, &chain)
             .expect("installed assets should be reused");
 
         let entries = local_bundle_entries(pack, &manifest.files)
@@ -4282,9 +4566,16 @@ mod tests {
             .timeout(Duration::from_millis(50))
             .build()
             .expect("short-timeout client should build");
-        let profile_id =
-            install_version_metadata(None, &client, &destination, "26.3", None, Some(&source))
-                .expect("complete local Minecraft files should be reused without a web request");
+        let profile_id = install_version_metadata(
+            None,
+            &client,
+            &destination,
+            "26.3",
+            None,
+            Some(&source),
+            &destination,
+        )
+        .expect("complete local Minecraft files should be reused without a web request");
 
         assert_eq!(profile_id, "26.3");
         assert_eq!(
@@ -4336,9 +4627,16 @@ mod tests {
             kind: LoaderKind::Fabric,
             version: "0.19.5".to_string(),
         };
-        let profile_id =
-            install_version_metadata(None, &client, &directory, "26.3", Some(&loader), None)
-                .expect("Minecraft and Fabric metadata should install");
+        let profile_id = install_version_metadata(
+            None,
+            &client,
+            &directory,
+            "26.3",
+            Some(&loader),
+            None,
+            &directory,
+        )
+        .expect("Minecraft and Fabric metadata should install");
         assert_eq!(profile_id, "fabric-loader-0.19.5-26.3");
         let minecraft = fs::read_to_string(directory.join("versions/26.3/26.3.json"))
             .expect("Minecraft 26.3 metadata should be installed");

@@ -1,6 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
+installer/src-tauri/target/
+installer/src-tauri/gen/schemas/
+installer/ui/dist/
 *.log
 .DS_Store
 *.exe

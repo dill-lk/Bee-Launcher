@@ -6,7 +6,7 @@
 
 # Bee Launcher
 
-**Version 0.1.33** · Tauri 2 · Windows-first Minecraft: Java Edition launcher
+**Version 0.1.34** · Tauri 2 · Windows-first Minecraft: Java Edition launcher
 
 Bee Launcher finds Minecraft Java profiles already installed on your PC and launches the one you choose. It also provides isolated modpack profiles, local world backups, launcher customization, and troubleshooting helpers. It is an independent project—not an official Mojang or Microsoft launcher.
 
@@ -16,7 +16,7 @@ Bee Launcher finds Minecraft Java profiles already installed on your PC and laun
 
 - **Find and launch local profiles.** Bee scans an existing `.minecraft` folder, detects profiles from their local metadata, and lets you choose a profile before starting it. Automatic folder discovery considers the contents of common Windows Minecraft locations; you can also select a folder yourself. Main Play and Quick Play start the selected profile directly.
 - **Choose compatible Java and performance settings.** Bee detects installed Java runtimes and checks a profile's required Java major version. You can choose a Java executable and memory limit per profile, set a default memory limit, and configure the game resolution and fullscreen mode. An optional Intel UHD low-impact graphics preset is off by default and restores the saved graphics options when returned to the default preset.
-- **Share game files without mixing packs.** Imported profiles use Bee Launcher's shared `assets`, `libraries`, and `versions` store. Each profile still has separate `mods`, `config`, `saves`, resource packs, shaders, launch options, logs, and native libraries. Bee copies common files from an existing `.minecraft` folder into its own store; it never hard-links back to or writes into that original folder. Existing imported profiles migrate only when any same-named common files are byte-identical; if files conflict, that profile's original runtime is left in place.
+- **Share game files without mixing packs.** Imported profiles share content-addressed asset objects, libraries, and version files. Each profile keeps its own verified asset-index JSON and its own `mods`, `config`, `saves`, resource packs, shaders, launch options, logs, and native libraries. This prevents two packs that use the same asset-index ID for different contents from breaking each other. Bee copies common files from an existing `.minecraft` folder into its own store; it never hard-links back to or writes into that original folder. Existing imported profiles migrate only when same-named shared files are byte-identical; if files conflict, their existing files remain untouched.
 - **Import isolated modpacks.** Import Modrinth format-v1 `.mrpack` packs, standard CurseForge Minecraft modpack `.zip` exports, or an offline Bee Launcher bundle `.zip`. Vanilla, Fabric, Quilt, Forge, and NeoForge are supported with one loader per pack. CurseForge dependencies are resolved by their exact project/file IDs through the public HTTPS file API and verified against the returned file sizes. Resource packs and shader files go into their profile-local folders using the categories in the export's `modlist.html`. Modrinth downloads retain manifest-hash verification. Forge and NeoForge may use their official client installers when no matching profile is already available. Imported instances live in Bee Launcher's app-data folder, not in the selected `.minecraft` folder.
 - **Keep a local skin library.** Add 64×64 or legacy 64×32 skin PNGs, select a launcher avatar, and view the active skin as an animated, mouse-interactive 3D character. Skin images stay on the PC.
 - **Back up and review worlds.** Create local ZIP backups for a selected profile's saves. Before a restore, Bee previews the worlds and name conflicts; replacing an existing world first creates a separate safety backup. Close Minecraft before restoring.
@@ -36,7 +36,7 @@ Bee Launcher finds Minecraft Java profiles already installed on your PC and laun
 
 ### Prerequisites
 
-Install Node.js, pnpm, Rust, Microsoft C++ Build Tools (including **Desktop development with C++**), and WebView2.
+Install Node.js, pnpm, Rust, Microsoft C++ Build Tools (including **Desktop development with C++**), and WebView2. When building the Windows release from Linux or macOS, also install `cargo-xwin` and the Windows target; on Windows, the script uses the native Rust toolchain.
 
 ### Run the development build
 
@@ -51,18 +51,19 @@ To build the frontend alone:
 pnpm build
 ```
 
-### Package installers
+### Build the custom Windows setup
 
 ```powershell
-pnpm tauri:build
+pnpm release:windows
 ```
 
-Tauri is configured to produce NSIS and MSI installers. Build outputs are placed under `src-tauri/target/release/bundle/`.
+This builds the launcher executable, embeds it into Bee's own themed setup app, and emits a standalone setup executable plus the launcher executable. The setup and uninstaller use Bee's branding, support per-user installation, create Start menu and optional desktop shortcuts, and register a normal Windows uninstall entry. The uninstall flow removes only Bee app files and owned shortcuts/registration; it deliberately keeps app data, profiles, worlds, saves, backups, and the selected `.minecraft` folder. No NSIS or MSI package is used. To build only the launcher executable for development, use `pnpm tauri:build`.
 
 ## Project structure
 
 - `src/` — Vite frontend, launcher UI, styling, and interactive skin preview.
 - `src-tauri/` — Tauri 2 Rust backend, launcher commands, modpack imports, crash-log helper, and world backup/restore code.
+- `installer/` — independent Tauri-based Bee setup/uninstaller UI and its embedded Windows launcher payload.
 - `src-tauri/icons/icon.png` and `src-tauri/icons/icon.ico` — existing Bee app icons used for the Windows app identity and installers.
 - `src/assets/minecraft-logo.svg` — Minecraft wordmark displayed in the launcher UI.
 - `assets/bee-launcher-icon.png` — reusable transparent PNG copy of the app icon for this README and other project materials.
