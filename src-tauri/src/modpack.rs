@@ -1971,12 +1971,49 @@ fn install_loader_profile(
     }
 }
 
+fn reuse_installed_minecraft_base(
+    app: Option<&AppHandle>,
+    source_game_dir: &Path,
+    destination_game_dir: &Path,
+    minecraft: &str,
+) -> Result<Option<Value>, String> {
+    let Some(metadata) = super::metadata_at(source_game_dir, minecraft) else {
+        return Ok(None);
+    };
+    if metadata.get("id").and_then(Value::as_str) != Some(minecraft)
+        || metadata.get("mainClass").and_then(Value::as_str).is_none()
+        || metadata.get("assetIndex").is_none()
+        || metadata.pointer("/downloads/client").is_none()
+    {
+        return Ok(None);
+    }
+    let chain = super::metadata_chain(source_game_dir, minecraft)?;
+    if chain.first().map(|(id, _)| id.as_str()) != Some(minecraft) {
+        return Ok(None);
+    }
+    if let Some(app) = app {
+        report_progress(
+            app,
+            "minecraft",
+            format!("Reusing installed Minecraft {minecraft} base files"),
+            0,
+            1,
+            15,
+        );
+    }
+    copy_installed_profile(source_game_dir, destination_game_dir, &chain)?;
+    copy_installed_libraries(source_game_dir, destination_game_dir, &chain)?;
+    copy_installed_assets(None, source_game_dir, destination_game_dir, &chain)?;
+    Ok(Some(metadata))
+}
+
 fn install_version_metadata(
     app: Option<&AppHandle>,
     client: &Client,
     game_dir: &Path,
     minecraft: &str,
     loader: Option<&LoaderPin>,
+    source_game_dir: Option<&Path>,
 ) -> Result<String, String> {
     if let Some(app) = app {
         report_progress(
@@ -1988,30 +2025,39 @@ fn install_version_metadata(
             15,
         );
     }
-    let manifest = minecraft_version_manifest(client, minecraft)?;
-    let versions = manifest
-        .get("versions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "The official Minecraft version list is incomplete.".to_string())?;
-    let entry = versions
-        .iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(minecraft))
-        .ok_or_else(|| {
-            format!("Minecraft {minecraft} is not listed by Mojang's version service.")
-        })?;
-    let metadata_url = entry
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("Minecraft {minecraft} has no version metadata URL."))?;
-    let expected_sha1 = entry.get("sha1").and_then(Value::as_str);
-    let minecraft_sources = mojang_version_metadata_sources(metadata_url)?;
-    let minecraft_metadata = request_json_from_sources(
-        client,
-        &minecraft_sources,
-        &format!("Minecraft {minecraft} metadata"),
-        expected_sha1,
-        16 * 1024 * 1024,
-    )?;
+    let local_metadata = if let Some(source_game_dir) = source_game_dir {
+        reuse_installed_minecraft_base(app, source_game_dir, game_dir, minecraft)?
+    } else {
+        None
+    };
+    let minecraft_metadata = if let Some(metadata) = local_metadata {
+        metadata
+    } else {
+        let manifest = minecraft_version_manifest(client, minecraft)?;
+        let versions = manifest
+            .get("versions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "The official Minecraft version list is incomplete.".to_string())?;
+        let entry = versions
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(minecraft))
+            .ok_or_else(|| {
+                format!("Minecraft {minecraft} is not listed by Mojang's version service.")
+            })?;
+        let metadata_url = entry
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Minecraft {minecraft} has no version metadata URL."))?;
+        let expected_sha1 = entry.get("sha1").and_then(Value::as_str);
+        let minecraft_sources = mojang_version_metadata_sources(metadata_url)?;
+        request_json_from_sources(
+            client,
+            &minecraft_sources,
+            &format!("Minecraft {minecraft} metadata"),
+            expected_sha1,
+            16 * 1024 * 1024,
+        )?
+    };
     if minecraft_metadata.get("id").and_then(Value::as_str) != Some(minecraft) {
         return Err("Mojang returned metadata for a different Minecraft version.".to_string());
     }
@@ -2980,11 +3026,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
             return Err("This Bee ZIP does not contain every client mod listed in its Modrinth manifest. Choose the original .mrpack or a complete Bee bundle instead.".to_string());
         }
     }
-    let installed_game_dir = if is_bundle || is_curseforge {
-        Some(super::resolve_game_dir(app)?)
-    } else {
-        None
-    };
+    let installed_game_dir = Some(super::resolve_game_dir(app)?);
     let instances = app_instances_dir(app)?;
     let (instance_id, instance_dir) = allocate_instance_dir(&instances, &details.name)?;
     let _store_guard = SHARED_GAME_FILES_LOCK
@@ -3074,6 +3116,7 @@ pub(super) fn import_modpack(app: &AppHandle, source: &str) -> Result<ImportResu
                 &common_dir,
                 &details.minecraft_version,
                 details.loader.as_ref(),
+                installed_game_dir.as_deref(),
             )?;
             report_progress(
                 app,
@@ -3805,6 +3848,81 @@ mod tests {
     }
 
     #[test]
+    fn reuses_installed_minecraft_base_without_fetching_mojang_manifest() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bee-local-minecraft-reuse-{unique}"));
+        let source = root.join("source");
+        let destination = root.join("shared");
+        let version_dir = source.join("versions/26.3");
+        fs::create_dir_all(&version_dir).expect("installed version folder should be created");
+
+        let client_jar = b"installed Minecraft 26.3 client";
+        let asset_index = serde_json::to_vec(&serde_json::json!({"objects": {}}))
+            .expect("asset index should encode");
+        let metadata = serde_json::json!({
+            "id": "26.3",
+            "mainClass": "net.minecraft.client.main.Main",
+            "downloads": {
+                "client": {
+                    "url": "https://example.invalid/client.jar",
+                    "sha1": sha1_bytes(client_jar),
+                    "size": client_jar.len()
+                }
+            },
+            "assetIndex": {
+                "id": "fixture-assets",
+                "url": "https://example.invalid/assets.json",
+                "sha1": sha1_bytes(&asset_index),
+                "size": asset_index.len()
+            },
+            "libraries": []
+        });
+        fs::write(
+            version_dir.join("26.3.json"),
+            serde_json::to_vec_pretty(&metadata).expect("version metadata should encode"),
+        )
+        .expect("installed version metadata should be written");
+        fs::write(version_dir.join("26.3.jar"), client_jar)
+            .expect("installed client JAR should be written");
+        let asset_index_path = source.join("assets/indexes/fixture-assets.json");
+        fs::create_dir_all(
+            asset_index_path
+                .parent()
+                .expect("asset index parent should exist"),
+        )
+        .expect("asset index folder should be created");
+        fs::write(&asset_index_path, &asset_index)
+            .expect("installed asset index should be written");
+
+        let client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("short-timeout client should build");
+        let profile_id =
+            install_version_metadata(None, &client, &destination, "26.3", None, Some(&source))
+                .expect("complete local Minecraft files should be reused without a web request");
+
+        assert_eq!(profile_id, "26.3");
+        assert_eq!(
+            fs::read(destination.join("versions/26.3/26.3.jar")).unwrap(),
+            client_jar
+        );
+        assert_eq!(
+            super::super::metadata_at(&destination, "26.3").as_ref(),
+            Some(&metadata)
+        );
+        assert_eq!(
+            fs::read(destination.join("assets/indexes/fixture-assets.json")).unwrap(),
+            asset_index
+        );
+        assert!(source.join("versions/26.3/26.3.jar").is_file());
+        fs::remove_dir_all(root).expect("fixture folders should be removed");
+    }
+
+    #[test]
     fn uses_only_official_mojang_hosts_for_version_metadata_fallbacks() {
         let sources = mojang_version_metadata_sources(
             "https://piston-meta.mojang.com/v1/packages/hash/26.3.json",
@@ -3837,8 +3955,9 @@ mod tests {
             kind: LoaderKind::Fabric,
             version: "0.19.5".to_string(),
         };
-        let profile_id = install_version_metadata(None, &client, &directory, "26.3", Some(&loader))
-            .expect("Minecraft and Fabric metadata should install");
+        let profile_id =
+            install_version_metadata(None, &client, &directory, "26.3", Some(&loader), None)
+                .expect("Minecraft and Fabric metadata should install");
         assert_eq!(profile_id, "fabric-loader-0.19.5-26.3");
         let minecraft = fs::read_to_string(directory.join("versions/26.3/26.3.json"))
             .expect("Minecraft 26.3 metadata should be installed");

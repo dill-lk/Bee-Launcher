@@ -3203,8 +3203,10 @@ fn launch_version(
 }
 
 #[tauri::command]
-fn import_modpack(app: AppHandle, path: String) -> Result<modpack::ImportResult, String> {
-    modpack::import_modpack(&app, &path)
+async fn import_modpack(app: AppHandle, path: String) -> Result<modpack::ImportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || modpack::import_modpack(&app, &path))
+        .await
+        .map_err(|error| format!("The modpack import worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
