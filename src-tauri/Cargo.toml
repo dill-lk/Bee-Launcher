@@ -1,6 +1,6 @@
 [package]
 name = "blockline-launcher"
-version = "0.1.39"
+version = "0.1.40"
 description = "A lightweight local Minecraft Java launcher"
 authors = ["Bee Launcher"]
 edition = "2021"

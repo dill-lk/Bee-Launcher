@@ -2436,6 +2436,15 @@ fn extract_native_archive(
     destination: &Path,
     excluded: &[String],
 ) -> Result<(), String> {
+    extract_native_archive_for_os(archive_path, destination, excluded, current_os_name())
+}
+
+fn extract_native_archive_for_os(
+    archive_path: &Path,
+    destination: &Path,
+    excluded: &[String],
+    os_name: &str,
+) -> Result<(), String> {
     let file = fs::File::open(archive_path).map_err(|error| {
         format!(
             "Could not open local native library {}: {error}",
@@ -2460,36 +2469,90 @@ fn extract_native_archive(
         let relative_text = relative.to_string_lossy().replace('\\', "/");
         if excluded.iter().any(|item| relative_text.starts_with(item))
             || entry.is_dir()
-            || !is_native_binary(&relative)
+            || !is_native_binary_for_os(&relative, os_name)
         {
             continue;
         }
-        let output_path = destination.join(relative);
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Could not prepare native library files: {error}"))?;
-        }
-        if output_path.is_file() {
-            continue;
-        }
-        let mut output = fs::File::create(output_path)
-            .map_err(|error| format!("Could not write native library files: {error}"))?;
-        io::copy(&mut entry, &mut output)
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
             .map_err(|error| format!("Could not extract a native library: {error}"))?;
+        let flat_path = relative
+            .file_name()
+            .map(|name| destination.join(name))
+            .unwrap_or_else(|| destination.join(&relative));
+        let nested_path = destination.join(&relative);
+        write_native_file_if_changed(&nested_path, &bytes)?;
+        // Minecraft 26.x stores LWJGL native DLLs in paths such as
+        // windows/x64/org/lwjgl/lwjgl.dll. Keep that hierarchy for LWJGL's
+        // bundled-path lookup and also expose each DLL directly in the
+        // java.library.path directory for the JVM's standard native lookup.
+        if flat_path != nested_path {
+            write_native_file_if_changed(&flat_path, &bytes)?;
+        }
     }
     Ok(())
 }
 
+fn write_native_file_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not prepare native library files: {error}"))?;
+    }
+    fs::write(path, bytes).map_err(|error| format!("Could not write native library files: {error}"))
+}
+
 fn is_native_binary(path: &Path) -> bool {
+    is_native_binary_for_os(path, current_os_name())
+}
+
+fn is_native_binary_for_os(path: &Path, os_name: &str) -> bool {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match current_os_name() {
+    match os_name {
         "windows" => extension == "dll",
         "osx" => matches!(extension.as_str(), "dylib" | "jnilib"),
         _ => extension == "so",
+    }
+}
+
+fn native_subdirectories(chain: &[(String, Value)], os_name: &str) -> HashSet<String> {
+    let mut directories = HashSet::new();
+    for (_, metadata) in chain {
+        for key in ["default_user_jvm", "jvm"] {
+            for argument in argument_values(metadata.pointer(&format!("/arguments/{key}")), os_name)
+            {
+                if let Some((_, remainder)) = argument.split_once("${natives_directory}/") {
+                    let subdirectory = remainder.split(['/', '\\']).next().unwrap_or("");
+                    if !subdirectory.is_empty()
+                        && subdirectory
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                    {
+                        directories.insert(subdirectory.to_string());
+                    }
+                }
+            }
+        }
+    }
+    directories
+}
+
+fn native_java_library_directory(
+    native_dir: &Path,
+    chain: &[(String, Value)],
+    os_name: &str,
+) -> PathBuf {
+    if native_subdirectories(chain, os_name).contains("java") {
+        native_dir.join("java")
+    } else {
+        native_dir.to_path_buf()
     }
 }
 
@@ -2505,6 +2568,14 @@ fn native_files_exist(directory: &Path) -> bool {
             is_native_binary(&path)
         }
     })
+}
+
+fn native_bootstrap_exists(directory: &Path, os_name: &str) -> bool {
+    if os_name == "windows" {
+        directory.join("lwjgl.dll").is_file()
+    } else {
+        native_files_exist(directory)
+    }
 }
 
 fn classpath_and_extract_natives(
@@ -2597,35 +2668,12 @@ fn classpath_and_extract_natives(
     };
     fs::create_dir_all(&native_dir)
         .map_err(|error| format!("Could not create the local Java native folder: {error}"))?;
-    let mut native_subdirectories = HashSet::new();
-    for (_, metadata) in chain {
-        for key in ["default_user_jvm", "jvm"] {
-            for argument in argument_values(
-                metadata.pointer(&format!("/arguments/{key}")),
-                current_os_name(),
-            ) {
-                if let Some((_, remainder)) = argument.split_once("${natives_directory}/") {
-                    let subdirectory = remainder.split(['/', '\\']).next().unwrap_or("");
-                    if !subdirectory.is_empty()
-                        && subdirectory
-                            .chars()
-                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                    {
-                        native_subdirectories.insert(subdirectory.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let native_subdirectories = native_subdirectories(chain, current_os_name());
     for subdirectory in &native_subdirectories {
         fs::create_dir_all(native_dir.join(subdirectory))
             .map_err(|error| format!("Could not prepare the native support folder: {error}"))?;
     }
-    let extract_dir = if native_subdirectories.contains("java") {
-        native_dir.join("java")
-    } else {
-        native_dir.clone()
-    };
+    let extract_dir = native_java_library_directory(&native_dir, chain, current_os_name());
     for (archive, excluded) in native_archives {
         extract_native_archive(&archive, &extract_dir, &excluded)?;
     }
@@ -2642,8 +2690,17 @@ fn classpath_and_extract_natives(
     });
     if profile_uses_native_path && !native_files_exist(&extract_dir) {
         return Err(format!(
-            "No {} native DLLs were found or extracted for this profile. Check the libraries folder and retry.",
+            "No {} native libraries were found or extracted for this profile. Check the selected Minecraft libraries folder and retry.",
             current_os_name()
+        ));
+    }
+    if profile_uses_native_path
+        && current_os_name() == "windows"
+        && !native_bootstrap_exists(&extract_dir, "windows")
+    {
+        return Err(format!(
+            "The required Windows LWJGL bootstrap native lwjgl.dll was not extracted to {}. Check that the selected Minecraft libraries include the matching Windows natives archive.",
+            extract_dir.display()
         ));
     }
 
@@ -2808,6 +2865,25 @@ fn set_game_option(args: &mut Vec<String>, option: &str, value: String) {
     }
     args.push(option.to_string());
     args.push(value);
+}
+
+fn set_jvm_system_property(args: &mut Vec<String>, name: &str, value: &Path) {
+    let prefix = format!("-D{name}=");
+    let bare = format!("-D{name}");
+    let mut index = 0;
+    while index < args.len() {
+        if args[index].starts_with(&prefix) {
+            args.remove(index);
+        } else if args[index] == bare {
+            args.remove(index);
+            if index < args.len() {
+                args.remove(index);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    args.push(format!("{prefix}{}", value.to_string_lossy()));
 }
 
 fn set_profile_game_directories(args: &mut Vec<String>, game_dir: &Path, base_dir: &Path) {
@@ -3174,7 +3250,13 @@ fn launch_game(
         .map(|arg| replace_placeholders(arg, &replacements))
         .collect();
 
-    if !jvm_args
+    let native_java_dir = native_java_library_directory(&native_dir, &chain, current_os_name());
+    if current_os_name() == "windows" {
+        // Keep both LWJGL's own resolver and the JVM fallback pointed at the
+        // same profile-owned folder, including when metadata contains stale paths.
+        set_jvm_system_property(&mut jvm_args, "java.library.path", &native_java_dir);
+        set_jvm_system_property(&mut jvm_args, "org.lwjgl.librarypath", &native_java_dir);
+    } else if !jvm_args
         .iter()
         .any(|arg| arg.starts_with("-Djava.library.path="))
     {
@@ -5085,6 +5167,104 @@ mod tests {
             fs::read(first.join("options.txt")).unwrap(),
             fs::read(second.join("options.txt")).unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_windows_lwjgl_natives_are_resolvable_from_profile_java_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bee-windows-native-resolution-{unique}"));
+        let base_dir = root.join("selected-minecraft");
+        let profile_dir = root.join("instances/profile with spaces");
+        let version_id = "Fabric 26.3";
+        let relative_archive = "libraries/org/lwjgl/lwjgl/3.4.3/lwjgl-3.4.3-natives-windows.jar";
+        let archive_path = base_dir.join(relative_archive);
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+
+        let archive_file = fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        for (name, bytes) in [
+            (
+                "windows/x64/org/lwjgl/lwjgl.dll",
+                b"fixture lwjgl dll".as_slice(),
+            ),
+            (
+                "windows/x64/org/lwjgl/glfw.dll",
+                b"fixture glfw dll".as_slice(),
+            ),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let base_archive_bytes = fs::read(&archive_path).unwrap();
+
+        let native_dir = profile_dir.join("native-libraries").join(version_id);
+        let java_native_dir = native_dir.join("java");
+        extract_native_archive_for_os(&archive_path, &java_native_dir, &[], "windows").unwrap();
+        let lwjgl_nested = java_native_dir.join("windows/x64/org/lwjgl/lwjgl.dll");
+        let glfw_nested = java_native_dir.join("windows/x64/org/lwjgl/glfw.dll");
+        assert_eq!(fs::read(&lwjgl_nested).unwrap(), b"fixture lwjgl dll");
+        assert_eq!(fs::read(&glfw_nested).unwrap(), b"fixture glfw dll");
+        assert_eq!(
+            fs::read(java_native_dir.join("lwjgl.dll")).unwrap(),
+            b"fixture lwjgl dll"
+        );
+        assert_eq!(
+            fs::read(java_native_dir.join("glfw.dll")).unwrap(),
+            b"fixture glfw dll"
+        );
+        assert!(native_bootstrap_exists(&java_native_dir, "windows"));
+
+        let metadata = serde_json::json!({
+            "arguments": {
+                "jvm": [{"values": [
+                    "-Djava.library.path=${natives_directory}/java",
+                    "-Dorg.lwjgl.librarypath=${natives_directory}/java"
+                ]}]
+            }
+        });
+        let chain = vec![(version_id.to_string(), metadata)];
+        assert_eq!(
+            native_java_library_directory(&native_dir, &chain, "windows"),
+            java_native_dir
+        );
+        let mut jvm_args = vec![
+            "-Djava.library.path=C:\\stale".to_string(),
+            "-Dorg.lwjgl.librarypath=C:\\stale".to_string(),
+            "-Djava.library.path=C:\\duplicate".to_string(),
+        ];
+        set_jvm_system_property(&mut jvm_args, "java.library.path", &java_native_dir);
+        set_jvm_system_property(&mut jvm_args, "org.lwjgl.librarypath", &java_native_dir);
+        let expected_path = format!("{}", java_native_dir.to_string_lossy());
+        assert_eq!(
+            jvm_args
+                .iter()
+                .filter(|arg| arg.starts_with("-Djava.library.path="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            jvm_args
+                .iter()
+                .filter(|arg| arg.starts_with("-Dorg.lwjgl.librarypath="))
+                .count(),
+            1
+        );
+        assert!(jvm_args.contains(&format!("-Djava.library.path={expected_path}")));
+        assert!(jvm_args.contains(&format!("-Dorg.lwjgl.librarypath={expected_path}")));
+
+        // The selected Minecraft base is read-only; extracted natives belong only to this profile.
+        assert_eq!(fs::read(&archive_path).unwrap(), base_archive_bytes);
+        assert!(!base_dir.join("native-libraries").exists());
+        assert!(profile_dir
+            .join("native-libraries/Fabric 26.3/java/lwjgl.dll")
+            .is_file());
         fs::remove_dir_all(root).unwrap();
     }
 

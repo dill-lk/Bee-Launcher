@@ -55,6 +55,13 @@ const accentColors = {
 const appearanceDefaults = { wallpaper: 'sunset', accent: 'green', opacity: 50, brightness: 100, blur: true };
 const beeReleaseNotes = [
   {
+    version: '0.1.40', date: '2026-11-13', title: 'Fix Windows LWJGL native loading',
+    changes: [
+      'Extracts nested Minecraft 26.x Windows native DLLs both in LWJGL’s expected layout and directly into each profile’s Java native-search folder.',
+      'Points both Java and LWJGL native resolution at the profile folder and checks for lwjgl.dll before starting the game; selected .minecraft libraries remain untouched.',
+    ],
+  },
+  {
     version: '0.1.39', date: '2026-11-13', title: 'Use the selected Minecraft folder directly',
     changes: [
       'Modpacks use the selected .minecraft assets, client JARs, versions, and libraries directly without copying or downloading Minecraft base files.',
