@@ -1,6 +1,6 @@
 {
   "name": "blockline-launcher",
-  "version": "0.1.34",
+  "version": "0.1.35",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,6 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "installer:build": "vite build --config installer/vite.config.js",
     "release:windows": "node scripts/build-windows.mjs"
   },
   "dependencies": {
